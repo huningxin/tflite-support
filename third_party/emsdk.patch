@@ -1,0 +1,12 @@
+diff --git a/bazel/emscripten_toolchain/emscripten_config b/bazel/emscripten_toolchain/emscripten_config
+index d1275ff..46de551 100644
+--- a/bazel/emscripten_toolchain/emscripten_config
++++ b/bazel/emscripten_toolchain/emscripten_config
+@@ -5,7 +5,6 @@ ROOT_DIR = os.environ["ROOT_DIR"]
+ EMSCRIPTEN_ROOT = os.environ["EMSCRIPTEN"]
+ BINARYEN_ROOT = ROOT_DIR + "/" + os.environ["EM_BIN_PATH"]
+ LLVM_ROOT = BINARYEN_ROOT + "/bin"
+-FROZEN_CACHE = True
+ 
+ system = platform.system()
+ nodejs_binary = "node.exe" if(system =="Windows") else "bin/node"

@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <meta charset="utf-8">
+<meta http-equiv="origin-trial" content="AhKfVKc00gLllWZbaUB/a3WIAhIRnqq9HJjVE2KOm863zpbfzLG9/wZ/wJm7vNSij6itls/upkar9KzdFhQKhgIAAAB9eyJvcmlnaW4iOiJodHRwczovL2h1bmluZ3hpbi5naXRodWIuaW86NDQzIiwiZmVhdHVyZSI6IlVucmVzdHJpY3RlZFNoYXJlZEFycmF5QnVmZmVyIiwiZXhwaXJ5IjoxNjM5NTI2Mzk5LCJpc1N1YmRvbWFpbiI6dHJ1ZX0=">
 <title>TFLite Web API Model Runner Demo</title>
 
 <head>
@@ -37,12 +38,35 @@
 
   <!-- Loading status -->
   <div class="loading-stats">Loading...</div>
-
-  <div class="content hide">
+  <div class="content">
+    <div>
+      Number of runs: <input type="number" id="numRuns" value="1" min="1" defaultValue="1"/>
+    </div>
+    <div>Model:
+      <select id="model">
+        <option value="mobilenetv2">MobileNetv2</option>
+        <option value="resnet_v2_50">ResNet50v2</option>
+      </select>
+    </div>
+    <div>
+      Use WebNN delegate: <input type="checkbox" id="webnnDelegate" />
+      Device preference:
+      <select id="webnnDevice">
+        <option value="0">default</option>
+        <option value="1">gpu</option>
+        <option value="2">cpu</option>
+      </select>
+    </div>
+    <div>
+      <input type="button" onclick="start()" value="Predict" id="predict" />
+    </div>
+  </div>
+  <div class="content">
     <img src="wine.jpeg" alt="wine"/>
     <div class="result"></div>
   </div>
-  <script src="./tflite_model_runner_cc.js"></script>
+  <script src="./webnn-polyfill/webnn-polyfill.js"></script>
+  <script src="./tflite_model_runner_cc_simd.js"></script>
   <script src="./script.js"></script>
 </body>
 </html>

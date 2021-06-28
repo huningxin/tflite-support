@@ -1,0 +1,3073 @@
+diff --git a/emcc.py b/emcc.py
+index beaddc73b..0ca5199a8 100755
+--- a/emcc.py
++++ b/emcc.py
+@@ -1826,6 +1826,7 @@ There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR P
+     if shared.Settings.RELOCATABLE or \
+        shared.Settings.BUILD_AS_WORKER or \
+        shared.Settings.USE_WEBGPU or \
++       shared.Settings.USE_WEBNN or \
+        shared.Settings.USE_PTHREADS or \
+        shared.Settings.OFFSCREENCANVAS_SUPPORT or \
+        shared.Settings.LEGACY_GL_EMULATION or \
+@@ -2609,9 +2610,6 @@ def parse_args(newargs):
+       else:
+         config.generate_config(optarg)
+       should_exit = True
+-    # Record USE_PTHREADS setting because it controls whether --shared-memory is passed to lld
+-    elif arg == '-pthread':
+-      settings_changes.append('USE_PTHREADS=1')
+     elif arg in ('-fno-diagnostics-color', '-fdiagnostics-color=never'):
+       colored_logger.disable()
+       diagnostics.color_enabled = False
+diff --git a/src/closure-externs/closure-externs.js b/src/closure-externs/closure-externs.js
+index 8361b3879..d71624bb2 100644
+--- a/src/closure-externs/closure-externs.js
++++ b/src/closure-externs/closure-externs.js
+@@ -284,3 +284,8 @@ var registerProcessor = function(name, obj) {};
+ var currentFrame;
+ var currentTime;
+ var sampleRate;
++
++/*
++ * WebNN globals
++ */
++var MLGraphBuilder;
+\ No newline at end of file
+diff --git a/src/library_html5_webnn.js b/src/library_html5_webnn.js
+new file mode 100644
+index 000000000..c2a236dac
+--- /dev/null
++++ b/src/library_html5_webnn.js
+@@ -0,0 +1,31 @@
++mergeInto(LibraryManager.library, {
++  emscripten_webnn_create_context__deps: ['$WebNN'],
++  emscripten_webnn_create_context__postset: 'WebNN.initManagers();',
++  emscripten_webnn_create_context: function(optionsPtr) {
++    var options = {
++      'devicePreference': 'default',
++      'powerPreference': 'default'
++    };
++
++    var DevicePreference = [
++      'default',
++      'gpu',
++      'cpu',
++    ];
++    var PowerPreference = [
++      'default',
++      'high-performance',
++      'low-power',
++    ];
++    if (optionsPtr !== 0) {
++      options = {
++          'devicePreference': DevicePreference[
++            {{{ makeGetValue('optionsPtr', C_STRUCTS.MLContextOptions.devicePreference, 'i32', false, true) }}}],
++          'powerPreference': PowerPreference[
++            {{{ makeGetValue('optionsPtr', C_STRUCTS.MLContextOptions.powerPreference, 'i32', false, true) }}}]
++      };
++    }
++    var context = navigator['ml'].createContext(options);
++    return WebNN.mgrContext.create(context);
++  },
++});
+diff --git a/src/library_pthread.js b/src/library_pthread.js
+index 93b184c0f..8c16ca81a 100644
+--- a/src/library_pthread.js
++++ b/src/library_pthread.js
+@@ -398,7 +398,7 @@ var LibraryPThread = {
+       };
+ 
+ #if ENVIRONMENT_MAY_BE_NODE
+-      if (ENVIRONMENT_IS_NODE) {
++      if (ENVIRONMENT_IS_NODE && worker.on !== undefined) {
+         worker.on('message', function(data) {
+           worker.onmessage({ data: data });
+         });
+diff --git a/src/library_webnn.js b/src/library_webnn.js
+new file mode 100644
+index 000000000..5d0b61a2d
+--- /dev/null
++++ b/src/library_webnn.js
+@@ -0,0 +1,719 @@
++/**
++ * @license
++ * Copyright 2021 The Emscripten Authors
++ * SPDX-License-Identifier: MIT
++ */
++
++/*
++ * WebNN support.
++ *
++ * This file implements the common C header <webnn/webnn.h> on top of the
++ * browser's native JS WebNN implementation. This allows applications targeting
++ * webnn-native (https://github.com/webmachinelearning/webnn-native) also target the Web with the
++ * same API and fairly minimal changes - similar to OpenGL ES 2.0/3.0
++ * on WebGL 1.0/2.0.
++ */
++
++{{{ (function() {
++  // Helper functions for code generation
++  global.webnn = {
++    makeInitManager: function(type) {
++      var mgr = 'WebNN.mgr' + type
++      return mgr + ' = ' + mgr + ' || makeManager();';
++    },
++
++    makeReferenceRelease: function(type) {
++      var s = '';
++      s += 'ml' + type + 'Reference: function(id) {\n';
++      s += '  WebNN.mgr' + type + '.reference(id);\n'
++      s += '},\n';
++      s += 'ml' + type + 'Release: function(id) {\n';
++      s += '  WebNN.mgr' + type + '.release(id);\n'
++      s += '},';
++      return s;
++    },
++
++    makeU64ToNumber: function(lowName, highName) {
++      var ret = '('
++      if (ASSERTIONS) {
++        ret += 'assert(' + highName + ' < 0x200000), ';
++      }
++      ret += highName + ' * 0x100000000 + ' + lowName + ')\n'
++      return ret;
++    },
++    makeGetBool: function(struct, offset) {
++      // In an actual build, bool seems to be i8. But on the off-chance it's i32, on little-endian
++      // this will still work as long as the value of 'true' isn't zero in the lowest byte.
++      return '(' + makeGetValue(struct, offset, 'i8') + ' !== 0)';
++    },
++    makeGetU32: function(struct, offset) {
++      return makeGetValue(struct, offset, 'i32', false, true);
++    },
++    makeGetI32: function(struct, offset) {
++      return makeGetValue(struct, offset, 'i32', false, false);
++    },
++    makeGetF32: function(struct, offset) {
++      return makeGetValue(struct, offset, 'float');
++    },
++    makeGetU64: function(struct, offset) {
++      var l = makeGetValue(struct, offset, 'i32', false, true);
++      var h = makeGetValue('(' + struct + ' + 4)', offset, 'i32', false, true)
++      return h + ' * 0x100000000 + ' + l
++    },
++    makeCheck: function(str) {
++      if (!ASSERTIONS) return '';
++      return 'assert(' + str + ');';
++    },
++    makeCheckDefined: function(name) {
++      return this.makeCheck('typeof ' + name + ' !== "undefined"');
++    },
++  };
++  return null;
++})(); }}}
++
++var LibraryWebNN = {
++  $WebNN: {
++    initManagers: function() {
++      if (WebNN.mgrContext) return;
++
++      function makeManager() {
++        return {
++          objects: {},
++          nextId: 1,
++          create: function(object, wrapper /* = {} */) {
++            wrapper = wrapper || {};
++
++            var id = this.nextId++;
++            {{{ webnn.makeCheck("typeof this.objects[id] === 'undefined'") }}}
++            wrapper.refcount = 1;
++            wrapper.object = object;
++            this.objects[id] = wrapper;
++            return id;
++          },
++          get: function(id) {
++            if (id === 0) return undefined;
++            var o = this.objects[id];
++            {{{ webnn.makeCheckDefined('o') }}}
++            return o.object;
++          },
++          reference: function(id) {
++            var o = this.objects[id];
++            {{{ webnn.makeCheckDefined('o') }}}
++            o.refcount++;
++          },
++          release: function(id) {
++            var o = this.objects[id];
++            {{{ webnn.makeCheckDefined('o') }}}
++            {{{ webnn.makeCheck('o.refcount > 0') }}}
++            o.refcount--;
++            if (o.refcount <= 0) {
++              delete this.objects[id];
++            }
++          },
++        };
++      }
++
++      {{{ webnn.makeInitManager('Context') }}}
++      {{{ webnn.makeInitManager('Graph') }}}
++      {{{ webnn.makeInitManager('GraphBuilder') }}}
++      {{{ webnn.makeInitManager('NamedInputs') }}}
++      {{{ webnn.makeInitManager('NamedOutputs') }}}
++      {{{ webnn.makeInitManager('NamedOperands') }}}
++      {{{ webnn.makeInitManager('Operand') }}}
++      {{{ webnn.makeInitManager('Operator') }}}
++    },
++
++    AutoPad: [
++      'explicit',
++      'same-upper',
++      'same-lower',
++    ],
++    ComputeGraphStatus: [
++      'success',
++      'error',
++      'context-lost',
++      'unknown',
++    ],
++    DevicePreference: [
++      'default',
++      'gpu',
++      'cpu',
++    ],
++    ErrorFilter: [
++      'none',
++      'validation',
++      'out-of-memory',
++    ],
++    ErrorType: [
++      'no-error',
++      'validation',
++      'out-of-memory',
++      'unknown',
++      'device-lost',
++    ],
++    FilterOperandLayout: [
++      'oihw',
++      'hwio',
++      'ohwi',
++      'ihwo',
++    ],
++    InputOperandLayout: [
++      'nchw',
++      'nhwc',
++    ],
++    InterpolationMode: [
++      'nearest-neighbor',
++      'linear',
++    ],
++    OperandType: [
++      'float32',
++      'float16',
++      'int32',
++      'uint32',
++      'int8',
++      'uint8',
++    ],
++    PaddingMode: [
++      'constant',
++      'edge',
++      'reflection',
++      'symmetric',
++    ],
++    PowerPreference: [
++      'default',
++      'high_performance',
++      'low_power',
++    ],
++    RecurrentNetworkDirection: [
++      'forward',
++      'backward',
++      'both',
++    ],
++    RecurrentNetworkWeightLayout: [
++      'zrn',
++      'rzn',
++    ],
++
++    makeI32Array: function(count, arrayPtr) {
++      if (count === 0 || arrayPtr === 0) {
++        return undefined;
++      }
++      var array = [];
++      for (var i = 0; i < count; ++i, arrayPtr += 4) {
++        array.push({{{ webnn.makeGetI32('arrayPtr', 0) }}});
++      }
++      return array;
++    },
++
++    makeF32Array: function(count, arrayPtr) {
++      if (count === 0 || arrayPtr === 0) {
++        return undefined;
++      }
++      var array = [];
++      for (var i = 0; i < count; ++i, arrayPtr += 4) {
++        array.push({{{ webnn.makeGetF32('arrayPtr', 0) }}});
++      }
++      return array;
++    },
++
++    makeArrayBufferView: function(ptr, type = "float32") {
++      const offset = {{{ makeGetValue('ptr', C_STRUCTS.MLArrayBufferView.buffer, '*') }}} + 
++          {{{ webnn.makeGetU32('ptr', C_STRUCTS.MLArrayBufferView.byteOffset) }}};
++      const byteSize = {{{ webnn.makeGetU32('ptr', C_STRUCTS.MLArrayBufferView.byteLength) }}};
++      if (type === "float32") {
++        return new Float32Array(HEAPU8.buffer, offset, byteSize / Float32Array.BYTES_PER_ELEMENT);
++      } else if (type === "uint32") {
++        return new Uint32Array(HEAPU8.buffer, offset, byteSize / Uint32Array.BYTES_PER_ELEMENT);
++      } else if (type === "int32") {
++        return new Int32Array(HEAPU8.buffer, offset, byteSize / Uint32Array.BYTES_PER_ELEMENT);
++      } else {
++        // TODO: support other array buffer view types.
++        console.warn(`operand type ${type} is not supported.`);
++        assert(false);
++      }
++    },
++
++    makeClampOptions: function(ptr) {
++      return {
++        "minValue": {{{ webnn.makeGetF32('ptr', C_STRUCTS.MLClampOptions.minValue) }}},
++        "maxValue": {{{ webnn.makeGetF32('ptr', C_STRUCTS.MLClampOptions.maxValue) }}},
++      };
++    },
++
++    makeBatchNormOptions: function(ptr) {
++      return {
++        "scale": WebNN.mgrOperand.get({{{ makeGetValue('ptr', C_STRUCTS.MLBatchNormOptions.scale, '*') }}}),
++        "bias": WebNN.mgrOperand.get({{{ makeGetValue('ptr', C_STRUCTS.MLBatchNormOptions.bias, '*') }}}),
++        "axis": {{{ webnn.makeGetI32('ptr', C_STRUCTS.MLBatchNormOptions.axis) }}},
++        "epsilon": {{{ webnn.makeGetF32('ptr', C_STRUCTS.MLBatchNormOptions.epsilon) }}},
++        "activation": WebNN.mgrOperator.get({{{ makeGetValue('ptr', C_STRUCTS.MLBatchNormOptions.activation, '*') }}}),
++      };
++    },
++
++    makeGemmOptions: function(ptr) {
++      return {
++        "c": WebNN.mgrOperand.get({{{ makeGetValue('ptr', C_STRUCTS.MLGemmOptions.c, '*') }}}),
++        "alpha": {{{ webnn.makeGetF32('ptr', C_STRUCTS.MLGemmOptions.alpha) }}},
++        "beta": {{{ webnn.makeGetF32('ptr', C_STRUCTS.MLGemmOptions.beta) }}},
++        "aTranspose": {{{ webnn.makeGetBool('ptr', C_STRUCTS.MLGemmOptions.aTranspose)}}},
++        "bTranspose": {{{ webnn.makeGetBool('ptr', C_STRUCTS.MLGemmOptions.bTranspose)}}},
++      };
++    },
++
++    makeLeakyReluOptions: function(ptr) {
++      return {
++        "alpha": {{{ webnn.makeGetF32('ptr', C_STRUCTS.MLLeakyReluOptions.alpha) }}},
++      };
++    },
++
++    makeOperandDescriptor: function(ptr) {
++      return {
++        "type": WebNN.OperandType[
++            {{{ webnn.makeGetU32('ptr', C_STRUCTS.MLOperandDescriptor.type) }}}
++        ],
++        "dimensions": WebNN.makeI32Array(
++            {{{ webnn.makeGetU32('ptr', C_STRUCTS.MLOperandDescriptor.dimensionsCount) }}},
++            {{{ makeGetValue('ptr', C_STRUCTS.MLOperandDescriptor.dimensions, '*') }}}
++        ),
++      };
++    },
++    
++    makeConv2dOptions: function(ptr) {
++      return {
++        "padding": WebNN.AutoPad[
++            {{{ webnn.makeGetI32('ptr', C_STRUCTS.MLConv2dOptions.autoPad) }}}
++          ] === 'explicit' ? WebNN.makeI32Array(
++            {{{ webnn.makeGetU32('ptr', C_STRUCTS.MLConv2dOptions.paddingCount) }}},
++            {{{ makeGetValue('ptr', C_STRUCTS.MLConv2dOptions.padding, '*') }}}
++          ) : undefined,
++        "strides": WebNN.makeI32Array(
++          {{{ webnn.makeGetU32('ptr', C_STRUCTS.MLConv2dOptions.stridesCount) }}},
++          {{{ makeGetValue('ptr', C_STRUCTS.MLConv2dOptions.strides, '*') }}}
++        ),
++        "dilations": WebNN.makeI32Array(
++          {{{ webnn.makeGetU32('ptr', C_STRUCTS.MLConv2dOptions.dilationsCount) }}},
++          {{{ makeGetValue('ptr', C_STRUCTS.MLConv2dOptions.dilations, '*') }}}
++        ),
++        "autoPad": WebNN.AutoPad[
++          {{{ webnn.makeGetI32('ptr', C_STRUCTS.MLConv2dOptions.autoPad) }}}
++        ],
++        "groups": {{{ webnn.makeGetI32('ptr', C_STRUCTS.MLConv2dOptions.groups) }}},
++        "inputLayout": WebNN.InputOperandLayout[
++          {{{ webnn.makeGetI32('ptr', C_STRUCTS.MLConv2dOptions.inputLayout) }}}
++        ],
++        "filterLayout": WebNN.FilterOperandLayout[
++          {{{ webnn.makeGetI32('ptr', C_STRUCTS.MLConv2dOptions.filterLayout) }}}
++        ],
++        "bias": WebNN.mgrOperand.get({{{ makeGetValue('ptr', C_STRUCTS.MLConv2dOptions.bias, '*') }}}),
++        "activation": WebNN.mgrOperator.get({{{ makeGetValue('ptr', C_STRUCTS.MLConv2dOptions.activation, '*') }}}),
++        "transpose": {{{ webnn.makeGetBool('ptr', C_STRUCTS.MLConv2dOptions.transpose)}}},
++        "outputPadding": WebNN.makeI32Array(
++          {{{ webnn.makeGetU32('ptr', C_STRUCTS.MLConv2dOptions.outputPaddingCount) }}},
++          {{{ makeGetValue('ptr', C_STRUCTS.MLConv2dOptions.outputPadding, '*') }}}
++        ),
++        "outputSizes": WebNN.makeI32Array(
++          {{{ webnn.makeGetU32('ptr', C_STRUCTS.MLConv2dOptions.outputSizesCount) }}},
++          {{{ makeGetValue('ptr', C_STRUCTS.MLConv2dOptions.outputSizes, '*') }}}
++        ),
++      };
++    },
++
++    makePool2dOptions: function(ptr) {
++      return {
++        "windowDimensions": WebNN.makeI32Array(
++          {{{ webnn.makeGetU32('ptr', C_STRUCTS.MLPool2dOptions.windowDimensionsCount) }}},
++          {{{ makeGetValue('ptr', C_STRUCTS.MLPool2dOptions.windowDimensions, '*') }}}
++        ),
++        "padding": WebNN.AutoPad[
++            {{{ webnn.makeGetI32('ptr', C_STRUCTS.MLPool2dOptions.autoPad) }}}
++          ] === 'explicit' ? WebNN.makeI32Array(
++            {{{ webnn.makeGetU32('ptr', C_STRUCTS.MLPool2dOptions.paddingCount) }}},
++            {{{ makeGetValue('ptr', C_STRUCTS.MLPool2dOptions.padding, '*') }}}
++          ) : undefined,
++        "strides": WebNN.makeI32Array(
++          {{{ webnn.makeGetU32('ptr', C_STRUCTS.MLPool2dOptions.stridesCount) }}},
++          {{{ makeGetValue('ptr', C_STRUCTS.MLPool2dOptions.strides, '*') }}}
++        ),
++        "dilations": WebNN.makeI32Array(
++          {{{ webnn.makeGetU32('ptr', C_STRUCTS.MLPool2dOptions.dilationsCount) }}},
++          {{{ makeGetValue('ptr', C_STRUCTS.MLPool2dOptions.dilations, '*') }}}
++        ),
++        "autoPad": WebNN.AutoPad[
++          {{{ webnn.makeGetI32('ptr', C_STRUCTS.MLPool2dOptions.autoPad) }}}
++        ],
++        "layout": WebNN.InputOperandLayout[
++          {{{ webnn.makeGetI32('ptr', C_STRUCTS.MLPool2dOptions.layout) }}}
++        ],
++      };
++    },
++
++    makePadOptions: function(ptr) {
++      return {
++        "mode": WebNN.PaddingMode[
++          {{{ webnn.makeGetI32('ptr', C_STRUCTS.MLPadOptions.mode) }}}
++        ],
++        "value": {{{ webnn.makeGetF32('ptr', C_STRUCTS.MLPadOptions.value) }}},
++      }
++    },
++
++    makeReduceOptions: function(ptr) {
++      return {
++        "axes": WebNN.makeI32Array(
++          {{{ webnn.makeGetU32('ptr', C_STRUCTS.MLReduceOptions.axesCount) }}},
++          {{{ makeGetValue('ptr', C_STRUCTS.MLReduceOptions.axes, '*') }}}
++        ),
++        "keepDimensions": {{{ webnn.makeGetBool('ptr', C_STRUCTS.MLReduceOptions.keepDimensions)}}},
++      }
++    },
++
++    makeInput: function(ptr) {
++      if ({{{ makeGetValue('ptr', C_STRUCTS.MLInput.dimensions, '*') }}} === 0) {
++        return WebNN.makeArrayBufferView(ptr + {{{ C_STRUCTS.MLInput.resource }}});
++      } else {
++        return {
++          "resource": WebNN.makeArrayBufferView(ptr + {{{ C_STRUCTS.MLInput.resource }}}),
++          "dimensions": WebNN.makeI32Array(
++              {{{ webnn.makeGetU32('ptr', C_STRUCTS.MLInput.dimensionsCount) }}},
++              {{{ makeGetValue('ptr', C_STRUCTS.MLInput.dimensions, '*') }}}
++          ),
++        };
++      }
++    },
++
++    makeTransposeOptions: function(ptr) {
++      return {
++        "permutation": WebNN.makeI32Array(
++          {{{ webnn.makeGetU32('ptr', C_STRUCTS.MLTransposeOptions.permutationCount) }}},
++          {{{ makeGetValue('ptr', C_STRUCTS.MLTransposeOptions.permutation, '*') }}}
++        )
++      };
++    },
++
++    makeResampleOptions: function(ptr) {
++      return {
++        "mode": WebNN.InterpolationMode[
++          {{{ webnn.makeGetI32('ptr', C_STRUCTS.MLResampleOptions.mode) }}}
++        ],
++        "scales": WebNN.makeF32Array(
++            {{{ webnn.makeGetU32('ptr', C_STRUCTS.MLResampleOptions.scalesCount) }}},
++            {{{ makeGetValue('ptr', C_STRUCTS.MLResampleOptions.scales, '*') }}}
++        ),
++        "sizes": WebNN.makeI32Array(
++            {{{ webnn.makeGetU32('ptr', C_STRUCTS.MLResampleOptions.sizesCount) }}},
++            {{{ makeGetValue('ptr', C_STRUCTS.MLResampleOptions.sizes, '*') }}}
++        ),
++      };
++    },
++
++  },
++
++  // *Reference/*Release
++
++  {{{ webnn.makeReferenceRelease('Context') }}}
++  {{{ webnn.makeReferenceRelease('Graph') }}}
++  {{{ webnn.makeReferenceRelease('GraphBuilder') }}}
++  {{{ webnn.makeReferenceRelease('NamedInputs') }}}
++  {{{ webnn.makeReferenceRelease('NamedOperands') }}}
++  {{{ webnn.makeReferenceRelease('NamedOutputs') }}}
++  {{{ webnn.makeReferenceRelease('Operand') }}}
++  {{{ webnn.makeReferenceRelease('Operator') }}}
++
++  // Methods of GraphBuilder
++  mlGraphBuilderAdd: function(builderId, aId, bId) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var a = WebNN.mgrOperand.get(aId);
++    var b = WebNN.mgrOperand.get(bId);
++    var c = builder["add"](a, b);
++    return WebNN.mgrOperand.create(c);
++  },
++
++  mlGraphBuilderAveragePool2d: function(builderId, inputId, optionsPtr) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var input = WebNN.mgrOperand.get(inputId);
++    var options = WebNN.makePool2dOptions(optionsPtr);
++    var pool2d = builder["averagePool2d"](input, options);
++    return WebNN.mgrOperand.create(pool2d);
++  },
++
++  mlGraphBuilderBatchNorm: function(builderId, inputId, meanId, varianceId, optionsPtr) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var input = WebNN.mgrOperand.get(inputId);
++    var mean = WebNN.mgrOperand.get(meanId);
++    var variance = WebNN.mgrOperand.get(varianceId);
++    var options = WebNN.makeBatchNormOptions(optionsPtr);
++    var output = builder["batchNormalization"](input, mean, variance, options);
++    return WebNN.mgrOperand.create(output);
++  },
++
++  mlGraphBuilderBuild: function(builderId, namedOperandsId) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var namedOperands = WebNN.mgrNamedOperands.get(namedOperandsId);
++    try {
++      var graph = builder["build"](namedOperands);
++      return WebNN.mgrGraph.create(graph);
++    } catch (error) {
++      console.log('builder.build failed: ' + error);
++      return 0;  // nullptr
++    }
++  },
++
++  mlGraphBuilderClamp: function(builderId, inputId, optionsPtr) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var input = WebNN.mgrOperand.get(inputId);
++    var options = WebNN.makeClampOptions(optionsPtr);
++    var clamp = builder["clamp"](input, options);
++    return WebNN.mgrOperand.create(clamp);
++  },
++
++  mlGraphBuilderClampOperator: function(builderId, optionsPtr) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var options = WebNN.makeClampOptions(optionsPtr);
++    var clamp = builder["clamp"](options);
++    return WebNN.mgrOperator.create(clamp);
++  },
++
++  mlGraphBuilderConcat: function(builderId, inputsCount, inputsPtr, axis) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var inputIds = WebNN.makeI32Array(inputsCount, inputsPtr);
++    var inputs = [];
++    for (var i = 0; i < inputIds.length; ++i) {
++      inputs.push(WebNN.mgrOperand.get(inputIds[i]));
++    }
++    var output = builder["concat"](inputs, axis);
++    return WebNN.mgrOperand.create(output);
++  },
++
++  mlGraphBuilderConstant: function(builderId, descPtr, arrayBufferViewPtr) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var desc = WebNN.makeOperandDescriptor(descPtr);
++    var buffer = WebNN.makeArrayBufferView(arrayBufferViewPtr, desc.type);
++    var constant;
++    if (desc["dimensions"] === undefined) {
++      constant = builder["constant"](buffer[0]);
++    } else {
++      constant = builder["constant"](desc, buffer);
++    }
++    return WebNN.mgrOperand.create(constant);
++  },
++
++  mlGraphBuilderConv2d: function(builderId, inputId, filterId, optionsPtr) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var input = WebNN.mgrOperand.get(inputId);
++    var filter = WebNN.mgrOperand.get(filterId);
++    var options = WebNN.makeConv2dOptions(optionsPtr);
++    var conv2d = builder["conv2d"](input, filter, options);
++    return WebNN.mgrOperand.create(conv2d);
++  },
++
++  mlGraphBuilderDiv: function(builderId, aId, bId) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var a = WebNN.mgrOperand.get(aId);
++    var b = WebNN.mgrOperand.get(bId);
++    var c = builder["div"](a, b);
++    return WebNN.mgrOperand.create(c);
++  },
++
++  mlGraphBuilderGemm: function(builderId, aId, bId, optionsPtr) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var a = WebNN.mgrOperand.get(aId);
++    var b = WebNN.mgrOperand.get(bId);
++    var options = WebNN.makeGemmOptions(optionsPtr);
++    var output = builder["gemm"](a, b, options);
++    return WebNN.mgrOperand.create(output);
++  },
++
++  mlGraphBuilderInput: function(builderId, namePtr, descPtr) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var name = UTF8ToString(namePtr);
++    var desc = WebNN.makeOperandDescriptor(descPtr);
++    var input = builder["input"](name, desc);
++    return WebNN.mgrOperand.create(input);
++  },
++
++  mlGraphBuilderHardSwish: function(builderId, inputId) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var input = WebNN.mgrOperand.get(inputId);
++    var output = builder["hardSwish"](input);
++    return WebNN.mgrOperand.create(output);
++  },
++
++  mlGraphBuilderHardSwishOperator: function(builderId) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var output = builder["hardSwish"]();
++    return WebNN.mgrOperator.create(output);
++  },
++
++  mlGraphBuilderLeakyRelu: function(builderId, inputId, optionsPtr) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var input = WebNN.mgrOperand.get(inputId);
++    var options = WebNN.makeLeakyReluOptions(optionsPtr);
++    var output = builder["leakyRelu"](input, options);
++    return WebNN.mgrOperand.create(output);
++  },
++
++  mlGraphBuilderLeakyReluOperator: function(builderId, optionsPtr) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var options = WebNN.makeLeakyReluOptions(optionsPtr);
++    var output = builder["leakyRelu"](options);
++    return WebNN.mgrOperator.create(output);
++  },
++
++  mlGraphBuilderMatmul: function(builderId, aId, bId) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var a = WebNN.mgrOperand.get(aId);
++    var b = WebNN.mgrOperand.get(bId);
++    var c = builder["matmul"](a, b);
++    return WebNN.mgrOperand.create(c);
++  },
++
++  mlGraphBuilderMaxPool2d: function(builderId, inputId, optionsPtr) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var input = WebNN.mgrOperand.get(inputId);
++    var options = WebNN.makePool2dOptions(optionsPtr);
++    var pool2d = builder["maxPool2d"](input, options);
++    return WebNN.mgrOperand.create(pool2d);
++  },
++
++  mlGraphBuilderMul: function(builderId, aId, bId) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var a = WebNN.mgrOperand.get(aId);
++    var b = WebNN.mgrOperand.get(bId);
++    var c = builder["mul"](a, b);
++    return WebNN.mgrOperand.create(c);
++  },
++
++  mlGraphBuilderPad: function(builderId, inputId, paddingId, optionsPtr) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var input = WebNN.mgrOperand.get(inputId);
++    var padding = WebNN.mgrOperand.get(paddingId);
++    var options = WebNN.makePadOptions(optionsPtr);
++    var output = builder["pad"](input, padding, options);
++    return WebNN.mgrOperand.create(output);
++  },
++
++  mlGraphBuilderReduceMean: function(builderId, inputId, optionsPtr) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var input = WebNN.mgrOperand.get(inputId);
++    var options = WebNN.makeReduceOptions(optionsPtr);
++    var output = builder["reduceMean"](input, options);
++    return WebNN.mgrOperand.create(output);
++  },
++
++  mlGraphBuilderRelu: function(builderId, inputId) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var input = WebNN.mgrOperand.get(inputId);
++    var output = builder["relu"](input);
++    return WebNN.mgrOperand.create(output);
++  },
++
++  mlGraphBuilderReluOperator: function(builderId) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var output = builder["relu"]();
++    return WebNN.mgrOperator.create(output);
++  },
++
++  mlGraphBuilderResample: function(builderId, inputId, optionsPtr) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var input = WebNN.mgrOperand.get(inputId);
++    var options = WebNN.makeResampleOptions(optionsPtr);
++    var output = builder["resample"](input, options);
++    return WebNN.mgrOperand.create(output);
++  },
++
++  mlGraphBuilderReshape: function(builderId, inputId, newShapePtr, newShapeCount) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var input = WebNN.mgrOperand.get(inputId);
++    var newShape = WebNN.makeI32Array(newShapeCount, newShapePtr);
++    var output = builder["reshape"](input, newShape);
++    return WebNN.mgrOperand.create(output);
++  },
++
++  mlGraphBuilderSigmoid: function(builderId, inputId) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var input = WebNN.mgrOperand.get(inputId);
++    var output = builder["sigmoid"](input);
++    return WebNN.mgrOperand.create(output);
++  },
++
++  mlGraphBuilderSigmoidOperator: function(builderId) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var output = builder["sigmoid"]();
++    return WebNN.mgrOperator.create(output);
++  },
++
++  mlGraphBuilderSoftmax: function(builderId, inputId) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var input = WebNN.mgrOperand.get(inputId);
++    var output = builder["softmax"](input);
++    return WebNN.mgrOperand.create(output);
++  },
++
++  mlGraphBuilderSub: function(builderId, aId, bId) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var a = WebNN.mgrOperand.get(aId);
++    var b = WebNN.mgrOperand.get(bId);
++    var c = builder["sub"](a, b);
++    return WebNN.mgrOperand.create(c);
++  },
++
++  mlGraphBuilderTranspose: function(builderId, inputId, optionsPtr) {
++    var builder = WebNN.mgrGraphBuilder.get(builderId);
++    var input = WebNN.mgrOperand.get(inputId);
++    var options = WebNN.makeTransposeOptions(optionsPtr);
++    var output = builder["transpose"](input, options);
++    return WebNN.mgrOperand.create(output);
++  },
++
++  webnnCreateNamedInputs: function() {
++    var inputs = {};
++    return WebNN.mgrNamedInputs.create(inputs);
++  },
++
++  mlNamedInputsSet: function(namedInputsId, namePtr, inputPtr) {
++    var namedInputs = WebNN.mgrNamedInputs.get(namedInputsId);
++    var name = UTF8ToString(namePtr);
++    var input = WebNN.makeInput(inputPtr);
++    namedInputs[name] = input;
++  },
++
++  webnnCreateNamedOutputs: function() {
++    var outputs = {};
++    return WebNN.mgrNamedOutputs.create(outputs);
++  },
++
++  mlNamedOutputsSet: function(namedOutputsId, namePtr, arrayBufferViewPtr) {
++    var namedOutputs = WebNN.mgrNamedOutputs.get(namedOutputsId);
++    var name = UTF8ToString(namePtr);
++    var output = WebNN.makeArrayBufferView(arrayBufferViewPtr);
++    namedOutputs[name] = output;
++  },
++
++  webnnCreateNamedOperands: function() {
++    var operands = {};
++    return WebNN.mgrNamedOperands.create(operands);
++  },
++
++  mlNamedOperandsSet: function(namedOperandsId, namePtr, operandId) {
++    var namedOperands = WebNN.mgrNamedOperands.get(namedOperandsId);
++    var name = UTF8ToString(namePtr);
++    var operand = WebNN.mgrOperand.get(operandId);
++    namedOperands[name] = operand;
++  },
++
++  webnnCreateGraphBuilder: function(contextId) {
++    var context = WebNN.mgrContext.get(contextId);
++    var builder = new MLGraphBuilder(context);
++    return WebNN.mgrGraphBuilder.create(builder);
++  },
++  
++  mlGraphCompute: function(graphId, inputsId, outputsId) {
++    var graph = WebNN.mgrGraph.get(graphId);
++    var inputs = WebNN.mgrNamedInputs.get(inputsId);
++    var outputs = WebNN.mgrNamedOutputs.get(outputsId);
++    return graph["compute"](inputs, outputs);
++  },
++
++};
++
++autoAddDeps(LibraryWebNN, '$WebNN');
++mergeInto(LibraryManager.library, LibraryWebNN);
+diff --git a/src/modules.js b/src/modules.js
+index 0a94d52ea..fa1eb1314 100644
+--- a/src/modules.js
++++ b/src/modules.js
+@@ -164,6 +164,11 @@ var LibraryManager = {
+       libraries.push('library_html5_webgpu.js');
+     }
+ 
++    if (USE_WEBNN) {
++      libraries.push('library_webnn.js');
++      libraries.push('library_html5_webnn.js');
++    }
++
+     if (BOOTSTRAPPING_STRUCT_INFO) {
+       libraries = [
+         'library_bootstrap.js',
+diff --git a/src/settings.js b/src/settings.js
+index eb43818c9..80267c4a1 100644
+--- a/src/settings.js
++++ b/src/settings.js
+@@ -546,6 +546,10 @@ var GL_PREINITIALIZED_CONTEXT = 0;
+ // [link]
+ var USE_WEBGPU = 0;
+ 
++// Enables support for WebNN (via "webnn/webnn.h").
++// [link]
++var USE_WEBNN = 0;
++
+ // Enables building of stb-image, a tiny public-domain library for decoding
+ // images, allowing decoding of images without using the browser's built-in
+ // decoders. The benefit is that this can be done synchronously, however, it
+diff --git a/src/shell.js b/src/shell.js
+index 95aca271e..484cf8e75 100644
+--- a/src/shell.js
++++ b/src/shell.js
+@@ -197,14 +197,16 @@ if (ENVIRONMENT_IS_NODE) {
+   Module['inspect'] = function () { return '[Emscripten Module object]'; };
+ 
+ #if USE_PTHREADS
+-  var nodeWorkerThreads;
+-  try {
+-    nodeWorkerThreads = require('worker_threads');
+-  } catch (e) {
+-    console.error('The "worker_threads" module is not supported in this node.js build - perhaps a newer version is needed?');
+-    throw e;
++  if (global.Worker === undefined) {
++    var nodeWorkerThreads;
++    try {
++      nodeWorkerThreads = require('worker_threads');
++    } catch (e) {
++      console.error('The "worker_threads" module is not supported in this node.js build - perhaps a newer version is needed?');
++      throw e;
++    }
++    global.Worker = nodeWorkerThreads.Worker;
+   }
+-  global.Worker = nodeWorkerThreads.Worker;
+ #endif
+ 
+ #if WASM == 2
+diff --git a/src/struct_info.json b/src/struct_info.json
+index 84793c90c..fc024b86f 100644
+--- a/src/struct_info.json
++++ b/src/struct_info.json
+@@ -1539,6 +1539,134 @@
+             ]
+         }
+     },
++    {
++        "file": "webnn/webnn.h",
++        "defines": [],
++        "structs": {
++            "MLArrayBufferView": [
++                "buffer",
++                "byteLength",
++                "byteOffset"
++            ],
++            "MLBatchNormOptions": [
++                "scale",
++                "bias",
++                "axis",
++                "epsilon",
++                "activation"
++            ],
++            "MLClampOptions": [
++                "minValue",
++                "maxValue"
++            ],
++            "MLContextOptions": [
++                "devicePreference",
++                "powerPreference"
++            ],
++            "MLConv2dOptions": [
++                "paddingCount",
++                "padding",
++                "stridesCount",
++                "strides",
++                "dilationsCount",
++                "dilations",
++                "outputPaddingCount",
++                "outputPadding",
++                "outputSizesCount",
++                "outputSizes",
++                "autoPad",
++                "transpose",
++                "groups",
++                "inputLayout",
++                "filterLayout",
++                "bias",
++                "activation"
++            ],
++            "MLGemmOptions": [
++                "c",
++                "alpha",
++                "beta",
++                "aTranspose",
++                "bTranspose"
++            ],
++            "MLGruOperators": [
++                "resetGateActivation",
++                "newGateActivation"
++            ],
++            "MLInstanceNormOptions": [
++                "scale",
++                "bias",
++                "epsilon",
++                "layout"
++            ],
++            "MLLeakyReluOptions": [
++                "alpha"
++            ],
++            "MLOperandDescriptor": [
++                "type",
++                "dimensions",
++                "dimensionsCount"
++            ],
++            "MLPadOptions": [
++                "mode",
++                "value"
++            ],
++            "MLPool2dOptions": [
++                "windowDimensionsCount",
++                "windowDimensions",
++                "paddingCount",
++                "padding",
++                "stridesCount",
++                "strides",
++                "dilationsCount",
++                "dilations",
++                "autoPad",
++                "layout"
++            ],
++            "MLReduceOptions": [
++                "axesCount",
++                "axes",
++                "keepDimensions"
++            ],
++            "MLResampleOptions": [
++                "mode",
++                "scalesCount",
++                "scales",
++                "sizesCount",
++                "sizes"
++            ],
++            "MLSliceOptions": [
++                "axesCount",
++                "axes"
++            ],
++            "MLSplitOptions": [
++                "axis"
++            ],
++            "MLSqueezeOptions": [
++                "axesCount",
++                "axes"
++            ],
++            "MLTransposeOptions": [
++                "permutationCount",
++                "permutation"
++            ],
++            "MLGruOptions": [
++                "bias",
++                "recurrentBias",
++                "initialHiddenState",
++                "resetAfter",
++                "returnSequence",
++                "direction",
++                "layout",
++                "activations"
++            ],
++            "MLInput": [
++                "resource",
++                "dimensions",
++                "dimensionsCount"
++            ]
++        }
++    },
+     // ===========================================
+     // WebGPU
+     //   NOTE: This can be (mostly) auto-generated:
+diff --git a/src/worker.js b/src/worker.js
+index 1a9ff901c..81cfcb2bf 100644
+--- a/src/worker.js
++++ b/src/worker.js
+@@ -232,7 +232,7 @@ this.onmessage = function(e) {
+           // FIXME(sbc): Figure out if this is still needed or useful.  Its not
+           // clear to me how this check could ever fail.  In order to get into
+           // this try/catch block at all we have already called bunch of
+-          // functions on `Module`.. why is this one special?
++          // functions on Module.. why is this one special?
+           if (typeof(Module['_emscripten_futex_wake']) !== "function") {
+             err("Thread Initialisation failed.");
+             throw ex;
+@@ -288,7 +288,7 @@ this.onmessage = function(e) {
+ 
+ #if ENVIRONMENT_MAY_BE_NODE
+ // Node.js support
+-if (typeof process === 'object' && typeof process.versions === 'object' && typeof process.versions.node === 'string') {
++if (typeof process === 'object' && typeof process.versions === 'object' && typeof process.versions.node === 'string' && global.Worker === undefined) {
+   // Create as web-worker-like an environment as we can.
+   self = {
+     location: {
+diff --git a/system/include/emscripten/html5_webnn.h b/system/include/emscripten/html5_webnn.h
+new file mode 100644
+index 000000000..055dc084f
+--- /dev/null
++++ b/system/include/emscripten/html5_webnn.h
+@@ -0,0 +1,20 @@
++/*
++ * Copyright 2021 The Emscripten Authors.  All rights reserved.
++ * Emscripten is available under two separate licenses, the MIT license and the
++ * University of Illinois/NCSA Open Source License.  Both these licenses can be
++ * found in the LICENSE file.
++ */
++
++#pragma once
++
++#include <webnn/webnn.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++MLContext emscripten_webnn_create_context(MLContextOptions const* options = nullptr);
++
++#ifdef __cplusplus
++} // ~extern "C"
++#endif
+\ No newline at end of file
+diff --git a/system/include/webnn/EnumClassBitmasks.h b/system/include/webnn/EnumClassBitmasks.h
+new file mode 100644
+index 000000000..bdef1df3d
+--- /dev/null
++++ b/system/include/webnn/EnumClassBitmasks.h
+@@ -0,0 +1,145 @@
++// Copyright 2017 The Dawn Authors
++// Copyright 2021 The WebNN-native Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#ifndef WEBNN_ENUM_CLASS_BITMASKS_H_
++#define WEBNN_ENUM_CLASS_BITMASKS_H_
++
++#include <type_traits>
++
++namespace webnn {
++
++    template <typename T>
++    struct IsDawnBitmask {
++        static constexpr bool enable = false;
++    };
++
++    template <typename T, typename Enable = void>
++    struct LowerBitmask {
++        static constexpr bool enable = false;
++    };
++
++    template <typename T>
++    struct LowerBitmask<T, typename std::enable_if<IsDawnBitmask<T>::enable>::type> {
++        static constexpr bool enable = true;
++        using type = T;
++        constexpr static T Lower(T t) {
++            return t;
++        }
++    };
++
++    template <typename T>
++    struct BoolConvertible {
++        using Integral = typename std::underlying_type<T>::type;
++
++        constexpr BoolConvertible(Integral value) : value(value) {
++        }
++        constexpr operator bool() const {
++            return value != 0;
++        }
++        constexpr operator T() const {
++            return static_cast<T>(value);
++        }
++
++        Integral value;
++    };
++
++    template <typename T>
++    struct LowerBitmask<BoolConvertible<T>> {
++        static constexpr bool enable = true;
++        using type = T;
++        static constexpr type Lower(BoolConvertible<T> t) {
++            return t;
++        }
++    };
++
++    template <typename T1,
++              typename T2,
++              typename = typename std::enable_if<LowerBitmask<T1>::enable &&
++                                                 LowerBitmask<T2>::enable>::type>
++    constexpr BoolConvertible<typename LowerBitmask<T1>::type> operator|(T1 left, T2 right) {
++        using T = typename LowerBitmask<T1>::type;
++        using Integral = typename std::underlying_type<T>::type;
++        return static_cast<Integral>(LowerBitmask<T1>::Lower(left)) |
++               static_cast<Integral>(LowerBitmask<T2>::Lower(right));
++    }
++
++    template <typename T1,
++              typename T2,
++              typename = typename std::enable_if<LowerBitmask<T1>::enable &&
++                                                 LowerBitmask<T2>::enable>::type>
++    constexpr BoolConvertible<typename LowerBitmask<T1>::type> operator&(T1 left, T2 right) {
++        using T = typename LowerBitmask<T1>::type;
++        using Integral = typename std::underlying_type<T>::type;
++        return static_cast<Integral>(LowerBitmask<T1>::Lower(left)) &
++               static_cast<Integral>(LowerBitmask<T2>::Lower(right));
++    }
++
++    template <typename T1,
++              typename T2,
++              typename = typename std::enable_if<LowerBitmask<T1>::enable &&
++                                                 LowerBitmask<T2>::enable>::type>
++    constexpr BoolConvertible<typename LowerBitmask<T1>::type> operator^(T1 left, T2 right) {
++        using T = typename LowerBitmask<T1>::type;
++        using Integral = typename std::underlying_type<T>::type;
++        return static_cast<Integral>(LowerBitmask<T1>::Lower(left)) ^
++               static_cast<Integral>(LowerBitmask<T2>::Lower(right));
++    }
++
++    template <typename T1>
++    constexpr BoolConvertible<typename LowerBitmask<T1>::type> operator~(T1 t) {
++        using T = typename LowerBitmask<T1>::type;
++        using Integral = typename std::underlying_type<T>::type;
++        return ~static_cast<Integral>(LowerBitmask<T1>::Lower(t));
++    }
++
++    template <typename T,
++              typename T2,
++              typename = typename std::enable_if<IsDawnBitmask<T>::enable &&
++                                                 LowerBitmask<T2>::enable>::type>
++    constexpr T& operator&=(T& l, T2 right) {
++        T r = LowerBitmask<T2>::Lower(right);
++        l = l & r;
++        return l;
++    }
++
++    template <typename T,
++              typename T2,
++              typename = typename std::enable_if<IsDawnBitmask<T>::enable &&
++                                                 LowerBitmask<T2>::enable>::type>
++    constexpr T& operator|=(T& l, T2 right) {
++        T r = LowerBitmask<T2>::Lower(right);
++        l = l | r;
++        return l;
++    }
++
++    template <typename T,
++              typename T2,
++              typename = typename std::enable_if<IsDawnBitmask<T>::enable &&
++                                                 LowerBitmask<T2>::enable>::type>
++    constexpr T& operator^=(T& l, T2 right) {
++        T r = LowerBitmask<T2>::Lower(right);
++        l = l ^ r;
++        return l;
++    }
++
++    template <typename T>
++    constexpr bool HasZeroOrOneBits(T value) {
++        using Integral = typename std::underlying_type<T>::type;
++        return (static_cast<Integral>(value) & (static_cast<Integral>(value) - 1)) == 0;
++    }
++
++}  // namespace webnn
++
++#endif  // WEBNN_ENUM_CLASS_BITMASKS_H_
+diff --git a/system/include/webnn/webnn.h b/system/include/webnn/webnn.h
+new file mode 100644
+index 000000000..a0c6866c5
+--- /dev/null
++++ b/system/include/webnn/webnn.h
+@@ -0,0 +1,502 @@
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#ifndef WEBNN_H_
++#define WEBNN_H_
++
++#if defined(WEBNN_SHARED_LIBRARY)
++#    if defined(_WIN32)
++#        if defined(WEBNN_IMPLEMENTATION)
++#            define WEBNN_EXPORT __declspec(dllexport)
++#        else
++#            define WEBNN_EXPORT __declspec(dllimport)
++#        endif
++#    else  // defined(_WIN32)
++#        if defined(WEBNN_IMPLEMENTATION)
++#            define WEBNN_EXPORT __attribute__((visibility("default")))
++#        else
++#            define WEBNN_EXPORT
++#        endif
++#    endif  // defined(_WIN32)
++#else       // defined(WEBNN_SHARED_LIBRARY)
++#    define WEBNN_EXPORT
++#endif  // defined(WEBNN_SHARED_LIBRARY)
++
++#include <stdint.h>
++#include <stddef.h>
++#include <stdbool.h>
++
++typedef uint32_t WEBNNFlags;
++
++typedef struct MLContextImpl* MLContext;
++typedef struct MLGraphImpl* MLGraph;
++typedef struct MLGraphBuilderImpl* MLGraphBuilder;
++typedef struct MLNamedInputsImpl* MLNamedInputs;
++typedef struct MLNamedOperandsImpl* MLNamedOperands;
++typedef struct MLNamedOutputsImpl* MLNamedOutputs;
++typedef struct MLOperandImpl* MLOperand;
++typedef struct MLOperandArrayImpl* MLOperandArray;
++typedef struct MLOperatorImpl* MLOperator;
++
++typedef enum MLAutoPad {
++    MLAutoPad_Explicit = 0x00000000,
++    MLAutoPad_SameUpper = 0x00000001,
++    MLAutoPad_SameLower = 0x00000002,
++    MLAutoPad_Force32 = 0x7FFFFFFF
++} MLAutoPad;
++
++typedef enum MLComputeGraphStatus {
++    MLComputeGraphStatus_Success = 0x00000000,
++    MLComputeGraphStatus_Error = 0x00000001,
++    MLComputeGraphStatus_ContextLost = 0x00000002,
++    MLComputeGraphStatus_Unknown = 0x00000003,
++    MLComputeGraphStatus_Force32 = 0x7FFFFFFF
++} MLComputeGraphStatus;
++
++typedef enum MLDevicePreference {
++    MLDevicePreference_Default = 0x00000000,
++    MLDevicePreference_Gpu = 0x00000001,
++    MLDevicePreference_Cpu = 0x00000002,
++    MLDevicePreference_Force32 = 0x7FFFFFFF
++} MLDevicePreference;
++
++typedef enum MLErrorFilter {
++    MLErrorFilter_None = 0x00000000,
++    MLErrorFilter_Validation = 0x00000001,
++    MLErrorFilter_OutOfMemory = 0x00000002,
++    MLErrorFilter_Force32 = 0x7FFFFFFF
++} MLErrorFilter;
++
++typedef enum MLErrorType {
++    MLErrorType_NoError = 0x00000000,
++    MLErrorType_Validation = 0x00000001,
++    MLErrorType_OutOfMemory = 0x00000002,
++    MLErrorType_Unknown = 0x00000003,
++    MLErrorType_DeviceLost = 0x00000004,
++    MLErrorType_Force32 = 0x7FFFFFFF
++} MLErrorType;
++
++typedef enum MLFilterOperandLayout {
++    MLFilterOperandLayout_Oihw = 0x00000000,
++    MLFilterOperandLayout_Hwio = 0x00000001,
++    MLFilterOperandLayout_Ohwi = 0x00000002,
++    MLFilterOperandLayout_Ihwo = 0x00000003,
++    MLFilterOperandLayout_Force32 = 0x7FFFFFFF
++} MLFilterOperandLayout;
++
++typedef enum MLInputOperandLayout {
++    MLInputOperandLayout_Nchw = 0x00000000,
++    MLInputOperandLayout_Nhwc = 0x00000001,
++    MLInputOperandLayout_Force32 = 0x7FFFFFFF
++} MLInputOperandLayout;
++
++typedef enum MLInterpolationMode {
++    MLInterpolationMode_NearestNeighbor = 0x00000000,
++    MLInterpolationMode_Linear = 0x00000001,
++    MLInterpolationMode_Force32 = 0x7FFFFFFF
++} MLInterpolationMode;
++
++typedef enum MLOperandType {
++    MLOperandType_Float32 = 0x00000000,
++    MLOperandType_Float16 = 0x00000001,
++    MLOperandType_Int32 = 0x00000002,
++    MLOperandType_Uint32 = 0x00000003,
++    MLOperandType_Int8 = 0x00000004,
++    MLOperandType_Uint8 = 0x00000005,
++    MLOperandType_Force32 = 0x7FFFFFFF
++} MLOperandType;
++
++typedef enum MLPaddingMode {
++    MLPaddingMode_Constant = 0x00000000,
++    MLPaddingMode_Edge = 0x00000001,
++    MLPaddingMode_Reflection = 0x00000002,
++    MLPaddingMode_Symmetric = 0x00000003,
++    MLPaddingMode_Force32 = 0x7FFFFFFF
++} MLPaddingMode;
++
++typedef enum MLPowerPreference {
++    MLPowerPreference_Default = 0x00000000,
++    MLPowerPreference_High_performance = 0x00000001,
++    MLPowerPreference_Low_power = 0x00000002,
++    MLPowerPreference_Force32 = 0x7FFFFFFF
++} MLPowerPreference;
++
++typedef enum MLRecurrentNetworkDirection {
++    MLRecurrentNetworkDirection_Forward = 0x00000000,
++    MLRecurrentNetworkDirection_Backward = 0x00000001,
++    MLRecurrentNetworkDirection_Both = 0x00000002,
++    MLRecurrentNetworkDirection_Force32 = 0x7FFFFFFF
++} MLRecurrentNetworkDirection;
++
++typedef enum MLRecurrentNetworkWeightLayout {
++    MLRecurrentNetworkWeightLayout_Zrn = 0x00000000,
++    MLRecurrentNetworkWeightLayout_Rzn = 0x00000001,
++    MLRecurrentNetworkWeightLayout_Force32 = 0x7FFFFFFF
++} MLRecurrentNetworkWeightLayout;
++
++
++typedef struct MLArrayBufferView {
++    void * buffer;
++    size_t byteLength;
++    size_t byteOffset;
++} MLArrayBufferView;
++
++typedef struct MLBatchNormOptions {
++    MLOperand scale;
++    MLOperand bias;
++    uint32_t axis;
++    float epsilon;
++    MLOperator activation;
++} MLBatchNormOptions;
++
++typedef struct MLClampOptions {
++    float minValue;
++    float maxValue;
++} MLClampOptions;
++
++typedef struct MLContextOptions {
++    MLDevicePreference devicePreference;
++    MLPowerPreference powerPreference;
++} MLContextOptions;
++
++typedef struct MLConv2dOptions {
++    uint32_t paddingCount;
++    int32_t const * padding;
++    uint32_t stridesCount;
++    int32_t const * strides;
++    uint32_t dilationsCount;
++    int32_t const * dilations;
++    uint32_t outputPaddingCount;
++    int32_t const * outputPadding;
++    uint32_t outputSizesCount;
++    int32_t const * outputSizes;
++    MLAutoPad autoPad;
++    bool transpose;
++    int32_t groups;
++    MLInputOperandLayout inputLayout;
++    MLFilterOperandLayout filterLayout;
++    MLOperand bias;
++    MLOperator activation;
++} MLConv2dOptions;
++
++typedef struct MLGemmOptions {
++    MLOperand c;
++    float alpha;
++    float beta;
++    bool aTranspose;
++    bool bTranspose;
++} MLGemmOptions;
++
++typedef struct MLGruOperators {
++    MLOperator resetGateActivation;
++    MLOperator newGateActivation;
++} MLGruOperators;
++
++typedef struct MLInstanceNormOptions {
++    MLOperand scale;
++    MLOperand bias;
++    float epsilon;
++    MLInputOperandLayout layout;
++} MLInstanceNormOptions;
++
++typedef struct MLLeakyReluOptions {
++    float alpha;
++} MLLeakyReluOptions;
++
++typedef struct MLOperandDescriptor {
++    MLOperandType type;
++    int32_t const * dimensions;
++    uint32_t dimensionsCount;
++} MLOperandDescriptor;
++
++typedef struct MLPadOptions {
++    MLPaddingMode mode;
++    float value;
++} MLPadOptions;
++
++typedef struct MLPool2dOptions {
++    uint32_t windowDimensionsCount;
++    int32_t const * windowDimensions;
++    uint32_t paddingCount;
++    int32_t const * padding;
++    uint32_t stridesCount;
++    int32_t const * strides;
++    uint32_t dilationsCount;
++    int32_t const * dilations;
++    MLAutoPad autoPad;
++    MLInputOperandLayout layout;
++} MLPool2dOptions;
++
++typedef struct MLReduceOptions {
++    uint32_t axesCount;
++    int32_t const * axes;
++    bool keepDimensions;
++} MLReduceOptions;
++
++typedef struct MLResampleOptions {
++    MLInterpolationMode mode;
++    uint32_t scalesCount;
++    float const * scales;
++    uint32_t sizesCount;
++    int32_t const * sizes;
++} MLResampleOptions;
++
++typedef struct MLSliceOptions {
++    uint32_t axesCount;
++    int32_t const * axes;
++} MLSliceOptions;
++
++typedef struct MLSplitOptions {
++    int32_t axis;
++} MLSplitOptions;
++
++typedef struct MLSqueezeOptions {
++    uint32_t axesCount;
++    int32_t const * axes;
++} MLSqueezeOptions;
++
++typedef struct MLTransposeOptions {
++    uint32_t permutationCount;
++    int32_t const * permutation;
++} MLTransposeOptions;
++
++typedef struct MLGruOptions {
++    MLOperand bias;
++    MLOperand recurrentBias;
++    MLOperand initialHiddenState;
++    bool resetAfter;
++    bool returnSequence;
++    MLRecurrentNetworkDirection direction;
++    MLRecurrentNetworkWeightLayout layout;
++    MLGruOperators activations;
++} MLGruOptions;
++
++typedef struct MLInput {
++    MLArrayBufferView resource;
++    int32_t const * dimensions;
++    uint32_t dimensionsCount;
++} MLInput;
++
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef void (*MLErrorCallback)(MLErrorType type, char const * message, void * userdata);
++
++typedef void (*WebnnProc)(void);
++
++#if !defined(WEBNN_SKIP_PROCS)
++
++typedef MLGraphBuilder (*WebnnProcCreateGraphBuilder)(MLContext context);
++typedef MLNamedInputs (*WebnnProcCreateNamedInputs)();
++typedef MLNamedOperands (*WebnnProcCreateNamedOperands)();
++typedef MLNamedOutputs (*WebnnProcCreateNamedOutputs)();
++
++// Procs of Context
++typedef bool (*WebnnProcContextPopErrorScope)(MLContext context, MLErrorCallback callback, void * userdata);
++typedef void (*WebnnProcContextPushErrorScope)(MLContext context, MLErrorFilter filter);
++typedef void (*WebnnProcContextSetUncapturedErrorCallback)(MLContext context, MLErrorCallback callback, void * userdata);
++typedef void (*WebnnProcContextReference)(MLContext context);
++typedef void (*WebnnProcContextRelease)(MLContext context);
++
++// Procs of Graph
++typedef MLComputeGraphStatus (*WebnnProcGraphCompute)(MLGraph graph, MLNamedInputs inputs, MLNamedOutputs outputs);
++typedef void (*WebnnProcGraphReference)(MLGraph graph);
++typedef void (*WebnnProcGraphRelease)(MLGraph graph);
++
++// Procs of GraphBuilder
++typedef MLOperand (*WebnnProcGraphBuilderAdd)(MLGraphBuilder graphBuilder, MLOperand a, MLOperand b);
++typedef MLOperand (*WebnnProcGraphBuilderAveragePool2d)(MLGraphBuilder graphBuilder, MLOperand input, MLPool2dOptions const * options);
++typedef MLOperand (*WebnnProcGraphBuilderBatchNorm)(MLGraphBuilder graphBuilder, MLOperand input, MLOperand mean, MLOperand variance, MLBatchNormOptions const * options);
++typedef MLGraph (*WebnnProcGraphBuilderBuild)(MLGraphBuilder graphBuilder, MLNamedOperands namedOperands);
++typedef MLOperand (*WebnnProcGraphBuilderClamp)(MLGraphBuilder graphBuilder, MLOperand input, MLClampOptions const * options);
++typedef MLOperator (*WebnnProcGraphBuilderClampOperator)(MLGraphBuilder graphBuilder, MLClampOptions const * options);
++typedef MLOperand (*WebnnProcGraphBuilderConcat)(MLGraphBuilder graphBuilder, uint32_t inputsCount, MLOperand const * inputs, uint32_t axis);
++typedef MLOperand (*WebnnProcGraphBuilderConstant)(MLGraphBuilder graphBuilder, MLOperandDescriptor const * desc, MLArrayBufferView const * value);
++typedef MLOperand (*WebnnProcGraphBuilderConv2d)(MLGraphBuilder graphBuilder, MLOperand input, MLOperand filter, MLConv2dOptions const * options);
++typedef MLOperand (*WebnnProcGraphBuilderDiv)(MLGraphBuilder graphBuilder, MLOperand a, MLOperand b);
++typedef MLOperand (*WebnnProcGraphBuilderGemm)(MLGraphBuilder graphBuilder, MLOperand a, MLOperand b, MLGemmOptions const * options);
++typedef MLOperandArray (*WebnnProcGraphBuilderGru)(MLGraphBuilder graphBuilder, MLOperand input, MLOperand weight, MLOperand recurrentWeight, int32_t steps, int32_t hiddenSize, MLGruOptions const * options);
++typedef MLOperand (*WebnnProcGraphBuilderHardSwish)(MLGraphBuilder graphBuilder, MLOperand input);
++typedef MLOperator (*WebnnProcGraphBuilderHardSwishOperator)(MLGraphBuilder graphBuilder);
++typedef MLOperand (*WebnnProcGraphBuilderInput)(MLGraphBuilder graphBuilder, char const * name, MLOperandDescriptor const * desc);
++typedef MLOperand (*WebnnProcGraphBuilderInstanceNorm)(MLGraphBuilder graphBuilder, MLOperand input, MLInstanceNormOptions const * options);
++typedef MLOperand (*WebnnProcGraphBuilderLeakyRelu)(MLGraphBuilder graphBuilder, MLOperand input, MLLeakyReluOptions const * options);
++typedef MLOperator (*WebnnProcGraphBuilderLeakyReluOperator)(MLGraphBuilder graphBuilder, MLLeakyReluOptions const * options);
++typedef MLOperand (*WebnnProcGraphBuilderMatmul)(MLGraphBuilder graphBuilder, MLOperand a, MLOperand b);
++typedef MLOperand (*WebnnProcGraphBuilderMax)(MLGraphBuilder graphBuilder, MLOperand a, MLOperand b);
++typedef MLOperand (*WebnnProcGraphBuilderMaxPool2d)(MLGraphBuilder graphBuilder, MLOperand input, MLPool2dOptions const * options);
++typedef MLOperand (*WebnnProcGraphBuilderMin)(MLGraphBuilder graphBuilder, MLOperand a, MLOperand b);
++typedef MLOperand (*WebnnProcGraphBuilderMul)(MLGraphBuilder graphBuilder, MLOperand a, MLOperand b);
++typedef MLOperand (*WebnnProcGraphBuilderPad)(MLGraphBuilder graphBuilder, MLOperand input, MLOperand padding, MLPadOptions const * options);
++typedef MLOperand (*WebnnProcGraphBuilderPow)(MLGraphBuilder graphBuilder, MLOperand a, MLOperand b);
++typedef MLOperand (*WebnnProcGraphBuilderReduceL1)(MLGraphBuilder graphBuilder, MLOperand input, MLReduceOptions const * options);
++typedef MLOperand (*WebnnProcGraphBuilderReduceL2)(MLGraphBuilder graphBuilder, MLOperand input, MLReduceOptions const * options);
++typedef MLOperand (*WebnnProcGraphBuilderReduceMax)(MLGraphBuilder graphBuilder, MLOperand input, MLReduceOptions const * options);
++typedef MLOperand (*WebnnProcGraphBuilderReduceMean)(MLGraphBuilder graphBuilder, MLOperand input, MLReduceOptions const * options);
++typedef MLOperand (*WebnnProcGraphBuilderReduceMin)(MLGraphBuilder graphBuilder, MLOperand input, MLReduceOptions const * options);
++typedef MLOperand (*WebnnProcGraphBuilderReduceProduct)(MLGraphBuilder graphBuilder, MLOperand input, MLReduceOptions const * options);
++typedef MLOperand (*WebnnProcGraphBuilderReduceSum)(MLGraphBuilder graphBuilder, MLOperand input, MLReduceOptions const * options);
++typedef MLOperand (*WebnnProcGraphBuilderRelu)(MLGraphBuilder graphBuilder, MLOperand input);
++typedef MLOperator (*WebnnProcGraphBuilderReluOperator)(MLGraphBuilder graphBuilder);
++typedef MLOperand (*WebnnProcGraphBuilderResample)(MLGraphBuilder graphBuilder, MLOperand input, MLResampleOptions const * options);
++typedef MLOperand (*WebnnProcGraphBuilderReshape)(MLGraphBuilder graphBuilder, MLOperand input, int32_t const * newShape, uint32_t newShapeCount);
++typedef MLOperand (*WebnnProcGraphBuilderSigmoid)(MLGraphBuilder graphBuilder, MLOperand input);
++typedef MLOperator (*WebnnProcGraphBuilderSigmoidOperator)(MLGraphBuilder graphBuilder);
++typedef MLOperand (*WebnnProcGraphBuilderSlice)(MLGraphBuilder graphBuilder, MLOperand input, int32_t const * starts, uint32_t startsCount, int32_t const * sizes, uint32_t sizesCount, MLSliceOptions const * options);
++typedef MLOperand (*WebnnProcGraphBuilderSoftmax)(MLGraphBuilder graphBuilder, MLOperand input);
++typedef MLOperandArray (*WebnnProcGraphBuilderSplit)(MLGraphBuilder graphBuilder, MLOperand input, uint32_t const * splits, uint32_t splitsCount, MLSplitOptions const * options);
++typedef MLOperand (*WebnnProcGraphBuilderSqueeze)(MLGraphBuilder graphBuilder, MLOperand input, MLSqueezeOptions const * options);
++typedef MLOperand (*WebnnProcGraphBuilderSub)(MLGraphBuilder graphBuilder, MLOperand a, MLOperand b);
++typedef MLOperand (*WebnnProcGraphBuilderTanh)(MLGraphBuilder graphBuilder, MLOperand input);
++typedef MLOperator (*WebnnProcGraphBuilderTanhOperator)(MLGraphBuilder graphBuilder);
++typedef MLOperand (*WebnnProcGraphBuilderTranspose)(MLGraphBuilder graphBuilder, MLOperand input, MLTransposeOptions const * options);
++typedef void (*WebnnProcGraphBuilderReference)(MLGraphBuilder graphBuilder);
++typedef void (*WebnnProcGraphBuilderRelease)(MLGraphBuilder graphBuilder);
++
++// Procs of NamedInputs
++typedef void (*WebnnProcNamedInputsSet)(MLNamedInputs namedInputs, char const * name, MLInput const * input);
++typedef void (*WebnnProcNamedInputsReference)(MLNamedInputs namedInputs);
++typedef void (*WebnnProcNamedInputsRelease)(MLNamedInputs namedInputs);
++
++// Procs of NamedOperands
++typedef void (*WebnnProcNamedOperandsSet)(MLNamedOperands namedOperands, char const * name, MLOperand operand);
++typedef void (*WebnnProcNamedOperandsReference)(MLNamedOperands namedOperands);
++typedef void (*WebnnProcNamedOperandsRelease)(MLNamedOperands namedOperands);
++
++// Procs of NamedOutputs
++typedef void (*WebnnProcNamedOutputsSet)(MLNamedOutputs namedOutputs, char const * name, MLArrayBufferView const * resource);
++typedef void (*WebnnProcNamedOutputsReference)(MLNamedOutputs namedOutputs);
++typedef void (*WebnnProcNamedOutputsRelease)(MLNamedOutputs namedOutputs);
++
++// Procs of Operand
++typedef void (*WebnnProcOperandReference)(MLOperand operand);
++typedef void (*WebnnProcOperandRelease)(MLOperand operand);
++
++// Procs of OperandArray
++typedef MLOperand (*WebnnProcOperandArrayGet)(MLOperandArray operandArray, size_t index);
++typedef size_t (*WebnnProcOperandArraySize)(MLOperandArray operandArray);
++typedef void (*WebnnProcOperandArrayReference)(MLOperandArray operandArray);
++typedef void (*WebnnProcOperandArrayRelease)(MLOperandArray operandArray);
++
++// Procs of Operator
++typedef void (*WebnnProcOperatorReference)(MLOperator mlOperator);
++typedef void (*WebnnProcOperatorRelease)(MLOperator mlOperator);
++
++#endif  // !defined(WEBNN_SKIP_PROCS)
++
++#if !defined(WEBNN_SKIP_DECLARATIONS)
++
++WEBNN_EXPORT MLGraphBuilder webnnCreateGraphBuilder(MLContext context);
++WEBNN_EXPORT MLNamedInputs webnnCreateNamedInputs();
++WEBNN_EXPORT MLNamedOperands webnnCreateNamedOperands();
++WEBNN_EXPORT MLNamedOutputs webnnCreateNamedOutputs();
++
++// Methods of Context
++WEBNN_EXPORT bool mlContextPopErrorScope(MLContext context, MLErrorCallback callback, void * userdata);
++WEBNN_EXPORT void mlContextPushErrorScope(MLContext context, MLErrorFilter filter);
++WEBNN_EXPORT void mlContextSetUncapturedErrorCallback(MLContext context, MLErrorCallback callback, void * userdata);
++WEBNN_EXPORT void mlContextReference(MLContext context);
++WEBNN_EXPORT void mlContextRelease(MLContext context);
++
++// Methods of Graph
++WEBNN_EXPORT MLComputeGraphStatus mlGraphCompute(MLGraph graph, MLNamedInputs inputs, MLNamedOutputs outputs);
++WEBNN_EXPORT void mlGraphReference(MLGraph graph);
++WEBNN_EXPORT void mlGraphRelease(MLGraph graph);
++
++// Methods of GraphBuilder
++WEBNN_EXPORT MLOperand mlGraphBuilderAdd(MLGraphBuilder graphBuilder, MLOperand a, MLOperand b);
++WEBNN_EXPORT MLOperand mlGraphBuilderAveragePool2d(MLGraphBuilder graphBuilder, MLOperand input, MLPool2dOptions const * options);
++WEBNN_EXPORT MLOperand mlGraphBuilderBatchNorm(MLGraphBuilder graphBuilder, MLOperand input, MLOperand mean, MLOperand variance, MLBatchNormOptions const * options);
++WEBNN_EXPORT MLGraph mlGraphBuilderBuild(MLGraphBuilder graphBuilder, MLNamedOperands namedOperands);
++WEBNN_EXPORT MLOperand mlGraphBuilderClamp(MLGraphBuilder graphBuilder, MLOperand input, MLClampOptions const * options);
++WEBNN_EXPORT MLOperator mlGraphBuilderClampOperator(MLGraphBuilder graphBuilder, MLClampOptions const * options);
++WEBNN_EXPORT MLOperand mlGraphBuilderConcat(MLGraphBuilder graphBuilder, uint32_t inputsCount, MLOperand const * inputs, uint32_t axis);
++WEBNN_EXPORT MLOperand mlGraphBuilderConstant(MLGraphBuilder graphBuilder, MLOperandDescriptor const * desc, MLArrayBufferView const * value);
++WEBNN_EXPORT MLOperand mlGraphBuilderConv2d(MLGraphBuilder graphBuilder, MLOperand input, MLOperand filter, MLConv2dOptions const * options);
++WEBNN_EXPORT MLOperand mlGraphBuilderDiv(MLGraphBuilder graphBuilder, MLOperand a, MLOperand b);
++WEBNN_EXPORT MLOperand mlGraphBuilderGemm(MLGraphBuilder graphBuilder, MLOperand a, MLOperand b, MLGemmOptions const * options);
++WEBNN_EXPORT MLOperandArray mlGraphBuilderGru(MLGraphBuilder graphBuilder, MLOperand input, MLOperand weight, MLOperand recurrentWeight, int32_t steps, int32_t hiddenSize, MLGruOptions const * options);
++WEBNN_EXPORT MLOperand mlGraphBuilderHardSwish(MLGraphBuilder graphBuilder, MLOperand input);
++WEBNN_EXPORT MLOperator mlGraphBuilderHardSwishOperator(MLGraphBuilder graphBuilder);
++WEBNN_EXPORT MLOperand mlGraphBuilderInput(MLGraphBuilder graphBuilder, char const * name, MLOperandDescriptor const * desc);
++WEBNN_EXPORT MLOperand mlGraphBuilderInstanceNorm(MLGraphBuilder graphBuilder, MLOperand input, MLInstanceNormOptions const * options);
++WEBNN_EXPORT MLOperand mlGraphBuilderLeakyRelu(MLGraphBuilder graphBuilder, MLOperand input, MLLeakyReluOptions const * options);
++WEBNN_EXPORT MLOperator mlGraphBuilderLeakyReluOperator(MLGraphBuilder graphBuilder, MLLeakyReluOptions const * options);
++WEBNN_EXPORT MLOperand mlGraphBuilderMatmul(MLGraphBuilder graphBuilder, MLOperand a, MLOperand b);
++WEBNN_EXPORT MLOperand mlGraphBuilderMax(MLGraphBuilder graphBuilder, MLOperand a, MLOperand b);
++WEBNN_EXPORT MLOperand mlGraphBuilderMaxPool2d(MLGraphBuilder graphBuilder, MLOperand input, MLPool2dOptions const * options);
++WEBNN_EXPORT MLOperand mlGraphBuilderMin(MLGraphBuilder graphBuilder, MLOperand a, MLOperand b);
++WEBNN_EXPORT MLOperand mlGraphBuilderMul(MLGraphBuilder graphBuilder, MLOperand a, MLOperand b);
++WEBNN_EXPORT MLOperand mlGraphBuilderPad(MLGraphBuilder graphBuilder, MLOperand input, MLOperand padding, MLPadOptions const * options);
++WEBNN_EXPORT MLOperand mlGraphBuilderPow(MLGraphBuilder graphBuilder, MLOperand a, MLOperand b);
++WEBNN_EXPORT MLOperand mlGraphBuilderReduceL1(MLGraphBuilder graphBuilder, MLOperand input, MLReduceOptions const * options);
++WEBNN_EXPORT MLOperand mlGraphBuilderReduceL2(MLGraphBuilder graphBuilder, MLOperand input, MLReduceOptions const * options);
++WEBNN_EXPORT MLOperand mlGraphBuilderReduceMax(MLGraphBuilder graphBuilder, MLOperand input, MLReduceOptions const * options);
++WEBNN_EXPORT MLOperand mlGraphBuilderReduceMean(MLGraphBuilder graphBuilder, MLOperand input, MLReduceOptions const * options);
++WEBNN_EXPORT MLOperand mlGraphBuilderReduceMin(MLGraphBuilder graphBuilder, MLOperand input, MLReduceOptions const * options);
++WEBNN_EXPORT MLOperand mlGraphBuilderReduceProduct(MLGraphBuilder graphBuilder, MLOperand input, MLReduceOptions const * options);
++WEBNN_EXPORT MLOperand mlGraphBuilderReduceSum(MLGraphBuilder graphBuilder, MLOperand input, MLReduceOptions const * options);
++WEBNN_EXPORT MLOperand mlGraphBuilderRelu(MLGraphBuilder graphBuilder, MLOperand input);
++WEBNN_EXPORT MLOperator mlGraphBuilderReluOperator(MLGraphBuilder graphBuilder);
++WEBNN_EXPORT MLOperand mlGraphBuilderResample(MLGraphBuilder graphBuilder, MLOperand input, MLResampleOptions const * options);
++WEBNN_EXPORT MLOperand mlGraphBuilderReshape(MLGraphBuilder graphBuilder, MLOperand input, int32_t const * newShape, uint32_t newShapeCount);
++WEBNN_EXPORT MLOperand mlGraphBuilderSigmoid(MLGraphBuilder graphBuilder, MLOperand input);
++WEBNN_EXPORT MLOperator mlGraphBuilderSigmoidOperator(MLGraphBuilder graphBuilder);
++WEBNN_EXPORT MLOperand mlGraphBuilderSlice(MLGraphBuilder graphBuilder, MLOperand input, int32_t const * starts, uint32_t startsCount, int32_t const * sizes, uint32_t sizesCount, MLSliceOptions const * options);
++WEBNN_EXPORT MLOperand mlGraphBuilderSoftmax(MLGraphBuilder graphBuilder, MLOperand input);
++WEBNN_EXPORT MLOperandArray mlGraphBuilderSplit(MLGraphBuilder graphBuilder, MLOperand input, uint32_t const * splits, uint32_t splitsCount, MLSplitOptions const * options);
++WEBNN_EXPORT MLOperand mlGraphBuilderSqueeze(MLGraphBuilder graphBuilder, MLOperand input, MLSqueezeOptions const * options);
++WEBNN_EXPORT MLOperand mlGraphBuilderSub(MLGraphBuilder graphBuilder, MLOperand a, MLOperand b);
++WEBNN_EXPORT MLOperand mlGraphBuilderTanh(MLGraphBuilder graphBuilder, MLOperand input);
++WEBNN_EXPORT MLOperator mlGraphBuilderTanhOperator(MLGraphBuilder graphBuilder);
++WEBNN_EXPORT MLOperand mlGraphBuilderTranspose(MLGraphBuilder graphBuilder, MLOperand input, MLTransposeOptions const * options);
++WEBNN_EXPORT void mlGraphBuilderReference(MLGraphBuilder graphBuilder);
++WEBNN_EXPORT void mlGraphBuilderRelease(MLGraphBuilder graphBuilder);
++
++// Methods of NamedInputs
++WEBNN_EXPORT void mlNamedInputsSet(MLNamedInputs namedInputs, char const * name, MLInput const * input);
++WEBNN_EXPORT void mlNamedInputsReference(MLNamedInputs namedInputs);
++WEBNN_EXPORT void mlNamedInputsRelease(MLNamedInputs namedInputs);
++
++// Methods of NamedOperands
++WEBNN_EXPORT void mlNamedOperandsSet(MLNamedOperands namedOperands, char const * name, MLOperand operand);
++WEBNN_EXPORT void mlNamedOperandsReference(MLNamedOperands namedOperands);
++WEBNN_EXPORT void mlNamedOperandsRelease(MLNamedOperands namedOperands);
++
++// Methods of NamedOutputs
++WEBNN_EXPORT void mlNamedOutputsSet(MLNamedOutputs namedOutputs, char const * name, MLArrayBufferView const * resource);
++WEBNN_EXPORT void mlNamedOutputsReference(MLNamedOutputs namedOutputs);
++WEBNN_EXPORT void mlNamedOutputsRelease(MLNamedOutputs namedOutputs);
++
++// Methods of Operand
++WEBNN_EXPORT void mlOperandReference(MLOperand operand);
++WEBNN_EXPORT void mlOperandRelease(MLOperand operand);
++
++// Methods of OperandArray
++WEBNN_EXPORT MLOperand mlOperandArrayGet(MLOperandArray operandArray, size_t index);
++WEBNN_EXPORT size_t mlOperandArraySize(MLOperandArray operandArray);
++WEBNN_EXPORT void mlOperandArrayReference(MLOperandArray operandArray);
++WEBNN_EXPORT void mlOperandArrayRelease(MLOperandArray operandArray);
++
++// Methods of Operator
++WEBNN_EXPORT void mlOperatorReference(MLOperator mlOperator);
++WEBNN_EXPORT void mlOperatorRelease(MLOperator mlOperator);
++
++#endif  // !defined(WEBNN_SKIP_DECLARATIONS)
++
++#ifdef __cplusplus
++} // extern "C"
++#endif
++
++#endif // WEBNN_H_
+diff --git a/system/include/webnn/webnn_cpp.h b/system/include/webnn/webnn_cpp.h
+new file mode 100644
+index 000000000..9b3ad1518
+--- /dev/null
++++ b/system/include/webnn/webnn_cpp.h
+@@ -0,0 +1,527 @@
++#ifndef WEBNN_CPP_H_
++#define WEBNN_CPP_H_
++
++#include "webnn/webnn.h"
++#include "webnn/EnumClassBitmasks.h"
++
++#include <limits>
++
++namespace ml {
++
++    enum class AutoPad : uint32_t {
++        Explicit = 0x00000000,
++        SameUpper = 0x00000001,
++        SameLower = 0x00000002,
++    };
++
++    enum class ComputeGraphStatus : uint32_t {
++        Success = 0x00000000,
++        Error = 0x00000001,
++        ContextLost = 0x00000002,
++        Unknown = 0x00000003,
++    };
++
++    enum class DevicePreference : uint32_t {
++        Default = 0x00000000,
++        Gpu = 0x00000001,
++        Cpu = 0x00000002,
++    };
++
++    enum class ErrorFilter : uint32_t {
++        None = 0x00000000,
++        Validation = 0x00000001,
++        OutOfMemory = 0x00000002,
++    };
++
++    enum class ErrorType : uint32_t {
++        NoError = 0x00000000,
++        Validation = 0x00000001,
++        OutOfMemory = 0x00000002,
++        Unknown = 0x00000003,
++        DeviceLost = 0x00000004,
++    };
++
++    enum class FilterOperandLayout : uint32_t {
++        Oihw = 0x00000000,
++        Hwio = 0x00000001,
++        Ohwi = 0x00000002,
++        Ihwo = 0x00000003,
++    };
++
++    enum class InputOperandLayout : uint32_t {
++        Nchw = 0x00000000,
++        Nhwc = 0x00000001,
++    };
++
++    enum class InterpolationMode : uint32_t {
++        NearestNeighbor = 0x00000000,
++        Linear = 0x00000001,
++    };
++
++    enum class OperandType : uint32_t {
++        Float32 = 0x00000000,
++        Float16 = 0x00000001,
++        Int32 = 0x00000002,
++        Uint32 = 0x00000003,
++        Int8 = 0x00000004,
++        Uint8 = 0x00000005,
++    };
++
++    enum class PaddingMode : uint32_t {
++        Constant = 0x00000000,
++        Edge = 0x00000001,
++        Reflection = 0x00000002,
++        Symmetric = 0x00000003,
++    };
++
++    enum class PowerPreference : uint32_t {
++        Default = 0x00000000,
++        High_performance = 0x00000001,
++        Low_power = 0x00000002,
++    };
++
++    enum class RecurrentNetworkDirection : uint32_t {
++        Forward = 0x00000000,
++        Backward = 0x00000001,
++        Both = 0x00000002,
++    };
++
++    enum class RecurrentNetworkWeightLayout : uint32_t {
++        Zrn = 0x00000000,
++        Rzn = 0x00000001,
++    };
++
++
++
++
++    using Proc = WebnnProc;
++    using ErrorCallback = MLErrorCallback;
++
++    class Context;
++    class Graph;
++    class GraphBuilder;
++    class NamedInputs;
++    class NamedOperands;
++    class NamedOutputs;
++    class Operand;
++    class OperandArray;
++    class Operator;
++
++    struct ArrayBufferView;
++    struct BatchNormOptions;
++    struct ClampOptions;
++    struct ContextOptions;
++    struct Conv2dOptions;
++    struct GemmOptions;
++    struct GruOperators;
++    struct InstanceNormOptions;
++    struct LeakyReluOptions;
++    struct OperandDescriptor;
++    struct PadOptions;
++    struct Pool2dOptions;
++    struct ReduceOptions;
++    struct ResampleOptions;
++    struct SliceOptions;
++    struct SplitOptions;
++    struct SqueezeOptions;
++    struct TransposeOptions;
++    struct GruOptions;
++    struct Input;
++
++    template<typename Derived, typename CType>
++    class ObjectBase {
++      public:
++        ObjectBase() = default;
++        ObjectBase(CType handle): mHandle(handle) {
++            if (mHandle) Derived::WebnnReference(mHandle);
++        }
++        ~ObjectBase() {
++            if (mHandle) Derived::WebnnRelease(mHandle);
++        }
++
++        ObjectBase(ObjectBase const& other)
++            : ObjectBase(other.GetHandle()) {
++        }
++        Derived& operator=(ObjectBase const& other) {
++            if (&other != this) {
++                if (mHandle) Derived::WebnnRelease(mHandle);
++                mHandle = other.mHandle;
++                if (mHandle) Derived::WebnnReference(mHandle);
++            }
++
++            return static_cast<Derived&>(*this);
++        }
++
++        ObjectBase(ObjectBase&& other) {
++            mHandle = other.mHandle;
++            other.mHandle = 0;
++        }
++        Derived& operator=(ObjectBase&& other) {
++            if (&other != this) {
++                if (mHandle) Derived::WebnnRelease(mHandle);
++                mHandle = other.mHandle;
++                other.mHandle = 0;
++            }
++
++            return static_cast<Derived&>(*this);
++        }
++
++        ObjectBase(std::nullptr_t) {}
++        Derived& operator=(std::nullptr_t) {
++            if (mHandle != nullptr) {
++                Derived::WebnnRelease(mHandle);
++                mHandle = nullptr;
++            }
++            return static_cast<Derived&>(*this);
++        }
++
++        bool operator==(std::nullptr_t) const {
++            return mHandle == nullptr;
++        }
++        bool operator!=(std::nullptr_t) const {
++            return mHandle != nullptr;
++        }
++
++        explicit operator bool() const {
++            return mHandle != nullptr;
++        }
++        CType GetHandle() const {
++            return mHandle;
++        }
++        CType Release() {
++            CType result = mHandle;
++            mHandle = 0;
++            return result;
++        }
++        static Derived Acquire(CType handle) {
++            Derived result;
++            result.mHandle = handle;
++            return result;
++        }
++
++      protected:
++        CType mHandle = nullptr;
++    };
++
++
++
++    class Context : public ObjectBase<Context, MLContext> {
++      public:
++        using ObjectBase::ObjectBase;
++        using ObjectBase::operator=;
++
++        bool PopErrorScope(ErrorCallback callback, void * userdata) const;
++        void PushErrorScope(ErrorFilter filter) const;
++        void SetUncapturedErrorCallback(ErrorCallback callback, void * userdata) const;
++
++      private:
++        friend ObjectBase<Context, MLContext>;
++        static void WebnnReference(MLContext handle);
++        static void WebnnRelease(MLContext handle);
++    };
++
++    class Graph : public ObjectBase<Graph, MLGraph> {
++      public:
++        using ObjectBase::ObjectBase;
++        using ObjectBase::operator=;
++
++        ComputeGraphStatus Compute(NamedInputs const& inputs, NamedOutputs const& outputs) const;
++
++      private:
++        friend ObjectBase<Graph, MLGraph>;
++        static void WebnnReference(MLGraph handle);
++        static void WebnnRelease(MLGraph handle);
++    };
++
++    class GraphBuilder : public ObjectBase<GraphBuilder, MLGraphBuilder> {
++      public:
++        using ObjectBase::ObjectBase;
++        using ObjectBase::operator=;
++
++        Operand Add(Operand const& a, Operand const& b) const;
++        Operand AveragePool2d(Operand const& input, Pool2dOptions const * options = nullptr) const;
++        Operand BatchNorm(Operand const& input, Operand const& mean, Operand const& variance, BatchNormOptions const * options = nullptr) const;
++        Graph Build(NamedOperands const& namedOperands) const;
++        Operand Clamp(Operand const& input, ClampOptions const * options = nullptr) const;
++        Operator ClampOperator(ClampOptions const * options = nullptr) const;
++        Operand Concat(uint32_t inputsCount, Operand const * inputs, uint32_t axis) const;
++        Operand Constant(OperandDescriptor const * desc, ArrayBufferView const * value) const;
++        Operand Conv2d(Operand const& input, Operand const& filter, Conv2dOptions const * options = nullptr) const;
++        Operand Div(Operand const& a, Operand const& b) const;
++        Operand Gemm(Operand const& a, Operand const& b, GemmOptions const * options = nullptr) const;
++        OperandArray Gru(Operand const& input, Operand const& weight, Operand const& recurrentWeight, int32_t steps, int32_t hiddenSize, GruOptions const * options = nullptr) const;
++        Operand HardSwish(Operand const& input) const;
++        Operator HardSwishOperator() const;
++        Operand Input(char const * name, OperandDescriptor const * desc) const;
++        Operand InstanceNorm(Operand const& input, InstanceNormOptions const * options = nullptr) const;
++        Operand LeakyRelu(Operand const& input, LeakyReluOptions const * options = nullptr) const;
++        Operator LeakyReluOperator(LeakyReluOptions const * options = nullptr) const;
++        Operand Matmul(Operand const& a, Operand const& b) const;
++        Operand Max(Operand const& a, Operand const& b) const;
++        Operand MaxPool2d(Operand const& input, Pool2dOptions const * options = nullptr) const;
++        Operand Min(Operand const& a, Operand const& b) const;
++        Operand Mul(Operand const& a, Operand const& b) const;
++        Operand Pad(Operand const& input, Operand const& padding, PadOptions const * options = nullptr) const;
++        Operand Pow(Operand const& a, Operand const& b) const;
++        Operand ReduceL1(Operand const& input, ReduceOptions const * options = nullptr) const;
++        Operand ReduceL2(Operand const& input, ReduceOptions const * options = nullptr) const;
++        Operand ReduceMax(Operand const& input, ReduceOptions const * options = nullptr) const;
++        Operand ReduceMean(Operand const& input, ReduceOptions const * options = nullptr) const;
++        Operand ReduceMin(Operand const& input, ReduceOptions const * options = nullptr) const;
++        Operand ReduceProduct(Operand const& input, ReduceOptions const * options = nullptr) const;
++        Operand ReduceSum(Operand const& input, ReduceOptions const * options = nullptr) const;
++        Operand Relu(Operand const& input) const;
++        Operator ReluOperator() const;
++        Operand Resample(Operand const& input, ResampleOptions const * options = nullptr) const;
++        Operand Reshape(Operand const& input, int32_t const * newShape, uint32_t newShapeCount) const;
++        Operand Sigmoid(Operand const& input) const;
++        Operator SigmoidOperator() const;
++        Operand Slice(Operand const& input, int32_t const * starts, uint32_t startsCount, int32_t const * sizes, uint32_t sizesCount, SliceOptions const * options = nullptr) const;
++        Operand Softmax(Operand const& input) const;
++        OperandArray Split(Operand const& input, uint32_t const * splits, uint32_t splitsCount, SplitOptions const * options = nullptr) const;
++        Operand Squeeze(Operand const& input, SqueezeOptions const * options = nullptr) const;
++        Operand Sub(Operand const& a, Operand const& b) const;
++        Operand Tanh(Operand const& input) const;
++        Operator TanhOperator() const;
++        Operand Transpose(Operand const& input, TransposeOptions const * options = nullptr) const;
++
++      private:
++        friend ObjectBase<GraphBuilder, MLGraphBuilder>;
++        static void WebnnReference(MLGraphBuilder handle);
++        static void WebnnRelease(MLGraphBuilder handle);
++    };
++
++    class NamedInputs : public ObjectBase<NamedInputs, MLNamedInputs> {
++      public:
++        using ObjectBase::ObjectBase;
++        using ObjectBase::operator=;
++
++        void Set(char const * name, Input const * input) const;
++
++      private:
++        friend ObjectBase<NamedInputs, MLNamedInputs>;
++        static void WebnnReference(MLNamedInputs handle);
++        static void WebnnRelease(MLNamedInputs handle);
++    };
++
++    class NamedOperands : public ObjectBase<NamedOperands, MLNamedOperands> {
++      public:
++        using ObjectBase::ObjectBase;
++        using ObjectBase::operator=;
++
++        void Set(char const * name, Operand const& operand) const;
++
++      private:
++        friend ObjectBase<NamedOperands, MLNamedOperands>;
++        static void WebnnReference(MLNamedOperands handle);
++        static void WebnnRelease(MLNamedOperands handle);
++    };
++
++    class NamedOutputs : public ObjectBase<NamedOutputs, MLNamedOutputs> {
++      public:
++        using ObjectBase::ObjectBase;
++        using ObjectBase::operator=;
++
++        void Set(char const * name, ArrayBufferView const * resource) const;
++
++      private:
++        friend ObjectBase<NamedOutputs, MLNamedOutputs>;
++        static void WebnnReference(MLNamedOutputs handle);
++        static void WebnnRelease(MLNamedOutputs handle);
++    };
++
++    class Operand : public ObjectBase<Operand, MLOperand> {
++      public:
++        using ObjectBase::ObjectBase;
++        using ObjectBase::operator=;
++
++
++      private:
++        friend ObjectBase<Operand, MLOperand>;
++        static void WebnnReference(MLOperand handle);
++        static void WebnnRelease(MLOperand handle);
++    };
++
++    class OperandArray : public ObjectBase<OperandArray, MLOperandArray> {
++      public:
++        using ObjectBase::ObjectBase;
++        using ObjectBase::operator=;
++
++        Operand Get(size_t index) const;
++        size_t Size() const;
++
++      private:
++        friend ObjectBase<OperandArray, MLOperandArray>;
++        static void WebnnReference(MLOperandArray handle);
++        static void WebnnRelease(MLOperandArray handle);
++    };
++
++    class Operator : public ObjectBase<Operator, MLOperator> {
++      public:
++        using ObjectBase::ObjectBase;
++        using ObjectBase::operator=;
++
++
++      private:
++        friend ObjectBase<Operator, MLOperator>;
++        static void WebnnReference(MLOperator handle);
++        static void WebnnRelease(MLOperator handle);
++    };
++
++
++    struct ChainedStruct {
++        ChainedStruct const * nextInChain = nullptr;
++        // SType sType = SType::Invalid;
++    };
++
++    struct ArrayBufferView {
++        void * buffer;
++        size_t byteLength;
++        size_t byteOffset = 0;
++    };
++
++    struct BatchNormOptions {
++        Operand scale;
++        Operand bias;
++        uint32_t axis = 1;
++        float epsilon = 1e-05;
++        Operator activation;
++    };
++
++    struct ClampOptions {
++        float minValue = std::numeric_limits<float>::lowest();
++        float maxValue = std::numeric_limits<float>::max();
++    };
++
++    struct ContextOptions {
++        DevicePreference devicePreference = DevicePreference::Default;
++        PowerPreference powerPreference = PowerPreference::Default;
++    };
++
++    struct Conv2dOptions {
++        uint32_t paddingCount = 0;
++        int32_t const * padding = nullptr;
++        uint32_t stridesCount = 0;
++        int32_t const * strides = nullptr;
++        uint32_t dilationsCount = 0;
++        int32_t const * dilations = nullptr;
++        uint32_t outputPaddingCount = 0;
++        int32_t const * outputPadding = nullptr;
++        uint32_t outputSizesCount = 0;
++        int32_t const * outputSizes = nullptr;
++        AutoPad autoPad = AutoPad::Explicit;
++        bool transpose = false;
++        int32_t groups = 1;
++        InputOperandLayout inputLayout = InputOperandLayout::Nchw;
++        FilterOperandLayout filterLayout = FilterOperandLayout::Oihw;
++        Operand bias;
++        Operator activation;
++    };
++
++    struct GemmOptions {
++        Operand c;
++        float alpha = 1.0;
++        float beta = 1.0;
++        bool aTranspose = false;
++        bool bTranspose = false;
++    };
++
++    struct GruOperators {
++        Operator resetGateActivation;
++        Operator newGateActivation;
++    };
++
++    struct InstanceNormOptions {
++        Operand scale;
++        Operand bias;
++        float epsilon = 1e-05;
++        InputOperandLayout layout = InputOperandLayout::Nchw;
++    };
++
++    struct LeakyReluOptions {
++        float alpha = 0.01;
++    };
++
++    struct OperandDescriptor {
++        OperandType type;
++        int32_t const * dimensions;
++        uint32_t dimensionsCount = 0;
++    };
++
++    struct PadOptions {
++        PaddingMode mode = PaddingMode::Constant;
++        float value = 0;
++    };
++
++    struct Pool2dOptions {
++        uint32_t windowDimensionsCount = 0;
++        int32_t const * windowDimensions = nullptr;
++        uint32_t paddingCount = 0;
++        int32_t const * padding = nullptr;
++        uint32_t stridesCount = 0;
++        int32_t const * strides = nullptr;
++        uint32_t dilationsCount = 0;
++        int32_t const * dilations = nullptr;
++        AutoPad autoPad = AutoPad::Explicit;
++        InputOperandLayout layout = InputOperandLayout::Nchw;
++    };
++
++    struct ReduceOptions {
++        uint32_t axesCount = 0;
++        int32_t const * axes = nullptr;
++        bool keepDimensions = false;
++    };
++
++    struct ResampleOptions {
++        InterpolationMode mode = InterpolationMode::NearestNeighbor;
++        uint32_t scalesCount = 0;
++        float const * scales = nullptr;
++        uint32_t sizesCount = 0;
++        int32_t const * sizes = nullptr;
++    };
++
++    struct SliceOptions {
++        uint32_t axesCount = 0;
++        int32_t const * axes = nullptr;
++    };
++
++    struct SplitOptions {
++        int32_t axis = 0;
++    };
++
++    struct SqueezeOptions {
++        uint32_t axesCount = 0;
++        int32_t const * axes = nullptr;
++    };
++
++    struct TransposeOptions {
++        uint32_t permutationCount = 0;
++        int32_t const * permutation = nullptr;
++    };
++
++    struct GruOptions {
++        Operand bias;
++        Operand recurrentBias;
++        Operand initialHiddenState;
++        bool resetAfter = true;
++        bool returnSequence = false;
++        RecurrentNetworkDirection direction = RecurrentNetworkDirection::Forward;
++        RecurrentNetworkWeightLayout layout = RecurrentNetworkWeightLayout::Zrn;
++        GruOperators activations;
++    };
++
++    struct Input {
++        ArrayBufferView resource;
++        int32_t const * dimensions = nullptr;
++        uint32_t dimensionsCount = 0;
++    };
++
++
++    GraphBuilder CreateGraphBuilder(Context context);
++    NamedInputs CreateNamedInputs();
++    NamedOperands CreateNamedOperands();
++    NamedOutputs CreateNamedOutputs();
++
++}  // namespace webnn
++
++#endif // WEBNN_CPP_H_
+diff --git a/system/lib/webnn/webnn_cpp.cpp b/system/lib/webnn/webnn_cpp.cpp
+new file mode 100644
+index 000000000..7facc3021
+--- /dev/null
++++ b/system/lib/webnn/webnn_cpp.cpp
+@@ -0,0 +1,789 @@
++#include "webnn/webnn_cpp.h"
++
++namespace ml {
++
++    // AutoPad
++
++    static_assert(sizeof(AutoPad) == sizeof(MLAutoPad), "sizeof mismatch for AutoPad");
++    static_assert(alignof(AutoPad) == alignof(MLAutoPad), "alignof mismatch for AutoPad");
++
++    static_assert(static_cast<uint32_t>(AutoPad::Explicit) == MLAutoPad_Explicit, "value mismatch for AutoPad::Explicit");
++    static_assert(static_cast<uint32_t>(AutoPad::SameUpper) == MLAutoPad_SameUpper, "value mismatch for AutoPad::SameUpper");
++    static_assert(static_cast<uint32_t>(AutoPad::SameLower) == MLAutoPad_SameLower, "value mismatch for AutoPad::SameLower");
++
++    // ComputeGraphStatus
++
++    static_assert(sizeof(ComputeGraphStatus) == sizeof(MLComputeGraphStatus), "sizeof mismatch for ComputeGraphStatus");
++    static_assert(alignof(ComputeGraphStatus) == alignof(MLComputeGraphStatus), "alignof mismatch for ComputeGraphStatus");
++
++    static_assert(static_cast<uint32_t>(ComputeGraphStatus::Success) == MLComputeGraphStatus_Success, "value mismatch for ComputeGraphStatus::Success");
++    static_assert(static_cast<uint32_t>(ComputeGraphStatus::Error) == MLComputeGraphStatus_Error, "value mismatch for ComputeGraphStatus::Error");
++    static_assert(static_cast<uint32_t>(ComputeGraphStatus::ContextLost) == MLComputeGraphStatus_ContextLost, "value mismatch for ComputeGraphStatus::ContextLost");
++    static_assert(static_cast<uint32_t>(ComputeGraphStatus::Unknown) == MLComputeGraphStatus_Unknown, "value mismatch for ComputeGraphStatus::Unknown");
++
++    // DevicePreference
++
++    static_assert(sizeof(DevicePreference) == sizeof(MLDevicePreference), "sizeof mismatch for DevicePreference");
++    static_assert(alignof(DevicePreference) == alignof(MLDevicePreference), "alignof mismatch for DevicePreference");
++
++    static_assert(static_cast<uint32_t>(DevicePreference::Default) == MLDevicePreference_Default, "value mismatch for DevicePreference::Default");
++    static_assert(static_cast<uint32_t>(DevicePreference::Gpu) == MLDevicePreference_Gpu, "value mismatch for DevicePreference::Gpu");
++    static_assert(static_cast<uint32_t>(DevicePreference::Cpu) == MLDevicePreference_Cpu, "value mismatch for DevicePreference::Cpu");
++
++    // ErrorFilter
++
++    static_assert(sizeof(ErrorFilter) == sizeof(MLErrorFilter), "sizeof mismatch for ErrorFilter");
++    static_assert(alignof(ErrorFilter) == alignof(MLErrorFilter), "alignof mismatch for ErrorFilter");
++
++    static_assert(static_cast<uint32_t>(ErrorFilter::None) == MLErrorFilter_None, "value mismatch for ErrorFilter::None");
++    static_assert(static_cast<uint32_t>(ErrorFilter::Validation) == MLErrorFilter_Validation, "value mismatch for ErrorFilter::Validation");
++    static_assert(static_cast<uint32_t>(ErrorFilter::OutOfMemory) == MLErrorFilter_OutOfMemory, "value mismatch for ErrorFilter::OutOfMemory");
++
++    // ErrorType
++
++    static_assert(sizeof(ErrorType) == sizeof(MLErrorType), "sizeof mismatch for ErrorType");
++    static_assert(alignof(ErrorType) == alignof(MLErrorType), "alignof mismatch for ErrorType");
++
++    static_assert(static_cast<uint32_t>(ErrorType::NoError) == MLErrorType_NoError, "value mismatch for ErrorType::NoError");
++    static_assert(static_cast<uint32_t>(ErrorType::Validation) == MLErrorType_Validation, "value mismatch for ErrorType::Validation");
++    static_assert(static_cast<uint32_t>(ErrorType::OutOfMemory) == MLErrorType_OutOfMemory, "value mismatch for ErrorType::OutOfMemory");
++    static_assert(static_cast<uint32_t>(ErrorType::Unknown) == MLErrorType_Unknown, "value mismatch for ErrorType::Unknown");
++    static_assert(static_cast<uint32_t>(ErrorType::DeviceLost) == MLErrorType_DeviceLost, "value mismatch for ErrorType::DeviceLost");
++
++    // FilterOperandLayout
++
++    static_assert(sizeof(FilterOperandLayout) == sizeof(MLFilterOperandLayout), "sizeof mismatch for FilterOperandLayout");
++    static_assert(alignof(FilterOperandLayout) == alignof(MLFilterOperandLayout), "alignof mismatch for FilterOperandLayout");
++
++    static_assert(static_cast<uint32_t>(FilterOperandLayout::Oihw) == MLFilterOperandLayout_Oihw, "value mismatch for FilterOperandLayout::Oihw");
++    static_assert(static_cast<uint32_t>(FilterOperandLayout::Hwio) == MLFilterOperandLayout_Hwio, "value mismatch for FilterOperandLayout::Hwio");
++    static_assert(static_cast<uint32_t>(FilterOperandLayout::Ohwi) == MLFilterOperandLayout_Ohwi, "value mismatch for FilterOperandLayout::Ohwi");
++    static_assert(static_cast<uint32_t>(FilterOperandLayout::Ihwo) == MLFilterOperandLayout_Ihwo, "value mismatch for FilterOperandLayout::Ihwo");
++
++    // InputOperandLayout
++
++    static_assert(sizeof(InputOperandLayout) == sizeof(MLInputOperandLayout), "sizeof mismatch for InputOperandLayout");
++    static_assert(alignof(InputOperandLayout) == alignof(MLInputOperandLayout), "alignof mismatch for InputOperandLayout");
++
++    static_assert(static_cast<uint32_t>(InputOperandLayout::Nchw) == MLInputOperandLayout_Nchw, "value mismatch for InputOperandLayout::Nchw");
++    static_assert(static_cast<uint32_t>(InputOperandLayout::Nhwc) == MLInputOperandLayout_Nhwc, "value mismatch for InputOperandLayout::Nhwc");
++
++    // InterpolationMode
++
++    static_assert(sizeof(InterpolationMode) == sizeof(MLInterpolationMode), "sizeof mismatch for InterpolationMode");
++    static_assert(alignof(InterpolationMode) == alignof(MLInterpolationMode), "alignof mismatch for InterpolationMode");
++
++    static_assert(static_cast<uint32_t>(InterpolationMode::NearestNeighbor) == MLInterpolationMode_NearestNeighbor, "value mismatch for InterpolationMode::NearestNeighbor");
++    static_assert(static_cast<uint32_t>(InterpolationMode::Linear) == MLInterpolationMode_Linear, "value mismatch for InterpolationMode::Linear");
++
++    // OperandType
++
++    static_assert(sizeof(OperandType) == sizeof(MLOperandType), "sizeof mismatch for OperandType");
++    static_assert(alignof(OperandType) == alignof(MLOperandType), "alignof mismatch for OperandType");
++
++    static_assert(static_cast<uint32_t>(OperandType::Float32) == MLOperandType_Float32, "value mismatch for OperandType::Float32");
++    static_assert(static_cast<uint32_t>(OperandType::Float16) == MLOperandType_Float16, "value mismatch for OperandType::Float16");
++    static_assert(static_cast<uint32_t>(OperandType::Int32) == MLOperandType_Int32, "value mismatch for OperandType::Int32");
++    static_assert(static_cast<uint32_t>(OperandType::Uint32) == MLOperandType_Uint32, "value mismatch for OperandType::Uint32");
++    static_assert(static_cast<uint32_t>(OperandType::Int8) == MLOperandType_Int8, "value mismatch for OperandType::Int8");
++    static_assert(static_cast<uint32_t>(OperandType::Uint8) == MLOperandType_Uint8, "value mismatch for OperandType::Uint8");
++
++    // PaddingMode
++
++    static_assert(sizeof(PaddingMode) == sizeof(MLPaddingMode), "sizeof mismatch for PaddingMode");
++    static_assert(alignof(PaddingMode) == alignof(MLPaddingMode), "alignof mismatch for PaddingMode");
++
++    static_assert(static_cast<uint32_t>(PaddingMode::Constant) == MLPaddingMode_Constant, "value mismatch for PaddingMode::Constant");
++    static_assert(static_cast<uint32_t>(PaddingMode::Edge) == MLPaddingMode_Edge, "value mismatch for PaddingMode::Edge");
++    static_assert(static_cast<uint32_t>(PaddingMode::Reflection) == MLPaddingMode_Reflection, "value mismatch for PaddingMode::Reflection");
++    static_assert(static_cast<uint32_t>(PaddingMode::Symmetric) == MLPaddingMode_Symmetric, "value mismatch for PaddingMode::Symmetric");
++
++    // PowerPreference
++
++    static_assert(sizeof(PowerPreference) == sizeof(MLPowerPreference), "sizeof mismatch for PowerPreference");
++    static_assert(alignof(PowerPreference) == alignof(MLPowerPreference), "alignof mismatch for PowerPreference");
++
++    static_assert(static_cast<uint32_t>(PowerPreference::Default) == MLPowerPreference_Default, "value mismatch for PowerPreference::Default");
++    static_assert(static_cast<uint32_t>(PowerPreference::High_performance) == MLPowerPreference_High_performance, "value mismatch for PowerPreference::High_performance");
++    static_assert(static_cast<uint32_t>(PowerPreference::Low_power) == MLPowerPreference_Low_power, "value mismatch for PowerPreference::Low_power");
++
++    // RecurrentNetworkDirection
++
++    static_assert(sizeof(RecurrentNetworkDirection) == sizeof(MLRecurrentNetworkDirection), "sizeof mismatch for RecurrentNetworkDirection");
++    static_assert(alignof(RecurrentNetworkDirection) == alignof(MLRecurrentNetworkDirection), "alignof mismatch for RecurrentNetworkDirection");
++
++    static_assert(static_cast<uint32_t>(RecurrentNetworkDirection::Forward) == MLRecurrentNetworkDirection_Forward, "value mismatch for RecurrentNetworkDirection::Forward");
++    static_assert(static_cast<uint32_t>(RecurrentNetworkDirection::Backward) == MLRecurrentNetworkDirection_Backward, "value mismatch for RecurrentNetworkDirection::Backward");
++    static_assert(static_cast<uint32_t>(RecurrentNetworkDirection::Both) == MLRecurrentNetworkDirection_Both, "value mismatch for RecurrentNetworkDirection::Both");
++
++    // RecurrentNetworkWeightLayout
++
++    static_assert(sizeof(RecurrentNetworkWeightLayout) == sizeof(MLRecurrentNetworkWeightLayout), "sizeof mismatch for RecurrentNetworkWeightLayout");
++    static_assert(alignof(RecurrentNetworkWeightLayout) == alignof(MLRecurrentNetworkWeightLayout), "alignof mismatch for RecurrentNetworkWeightLayout");
++
++    static_assert(static_cast<uint32_t>(RecurrentNetworkWeightLayout::Zrn) == MLRecurrentNetworkWeightLayout_Zrn, "value mismatch for RecurrentNetworkWeightLayout::Zrn");
++    static_assert(static_cast<uint32_t>(RecurrentNetworkWeightLayout::Rzn) == MLRecurrentNetworkWeightLayout_Rzn, "value mismatch for RecurrentNetworkWeightLayout::Rzn");
++
++    // ChainedStruct
++
++
++    // ArrayBufferView
++
++    static_assert(sizeof(ArrayBufferView) == sizeof(MLArrayBufferView), "sizeof mismatch for ArrayBufferView");
++    static_assert(alignof(ArrayBufferView) == alignof(MLArrayBufferView), "alignof mismatch for ArrayBufferView");
++
++    static_assert(offsetof(ArrayBufferView, buffer) == offsetof(MLArrayBufferView, buffer),
++            "offsetof mismatch for ArrayBufferView::buffer");
++    static_assert(offsetof(ArrayBufferView, byteLength) == offsetof(MLArrayBufferView, byteLength),
++            "offsetof mismatch for ArrayBufferView::byteLength");
++    static_assert(offsetof(ArrayBufferView, byteOffset) == offsetof(MLArrayBufferView, byteOffset),
++            "offsetof mismatch for ArrayBufferView::byteOffset");
++
++    // BatchNormOptions
++
++    static_assert(sizeof(BatchNormOptions) == sizeof(MLBatchNormOptions), "sizeof mismatch for BatchNormOptions");
++    static_assert(alignof(BatchNormOptions) == alignof(MLBatchNormOptions), "alignof mismatch for BatchNormOptions");
++
++    static_assert(offsetof(BatchNormOptions, scale) == offsetof(MLBatchNormOptions, scale),
++            "offsetof mismatch for BatchNormOptions::scale");
++    static_assert(offsetof(BatchNormOptions, bias) == offsetof(MLBatchNormOptions, bias),
++            "offsetof mismatch for BatchNormOptions::bias");
++    static_assert(offsetof(BatchNormOptions, axis) == offsetof(MLBatchNormOptions, axis),
++            "offsetof mismatch for BatchNormOptions::axis");
++    static_assert(offsetof(BatchNormOptions, epsilon) == offsetof(MLBatchNormOptions, epsilon),
++            "offsetof mismatch for BatchNormOptions::epsilon");
++    static_assert(offsetof(BatchNormOptions, activation) == offsetof(MLBatchNormOptions, activation),
++            "offsetof mismatch for BatchNormOptions::activation");
++
++    // ClampOptions
++
++    static_assert(sizeof(ClampOptions) == sizeof(MLClampOptions), "sizeof mismatch for ClampOptions");
++    static_assert(alignof(ClampOptions) == alignof(MLClampOptions), "alignof mismatch for ClampOptions");
++
++    static_assert(offsetof(ClampOptions, minValue) == offsetof(MLClampOptions, minValue),
++            "offsetof mismatch for ClampOptions::minValue");
++    static_assert(offsetof(ClampOptions, maxValue) == offsetof(MLClampOptions, maxValue),
++            "offsetof mismatch for ClampOptions::maxValue");
++
++    // ContextOptions
++
++    static_assert(sizeof(ContextOptions) == sizeof(MLContextOptions), "sizeof mismatch for ContextOptions");
++    static_assert(alignof(ContextOptions) == alignof(MLContextOptions), "alignof mismatch for ContextOptions");
++
++    static_assert(offsetof(ContextOptions, devicePreference) == offsetof(MLContextOptions, devicePreference),
++            "offsetof mismatch for ContextOptions::devicePreference");
++    static_assert(offsetof(ContextOptions, powerPreference) == offsetof(MLContextOptions, powerPreference),
++            "offsetof mismatch for ContextOptions::powerPreference");
++
++    // Conv2dOptions
++
++    static_assert(sizeof(Conv2dOptions) == sizeof(MLConv2dOptions), "sizeof mismatch for Conv2dOptions");
++    static_assert(alignof(Conv2dOptions) == alignof(MLConv2dOptions), "alignof mismatch for Conv2dOptions");
++
++    static_assert(offsetof(Conv2dOptions, paddingCount) == offsetof(MLConv2dOptions, paddingCount),
++            "offsetof mismatch for Conv2dOptions::paddingCount");
++    static_assert(offsetof(Conv2dOptions, padding) == offsetof(MLConv2dOptions, padding),
++            "offsetof mismatch for Conv2dOptions::padding");
++    static_assert(offsetof(Conv2dOptions, stridesCount) == offsetof(MLConv2dOptions, stridesCount),
++            "offsetof mismatch for Conv2dOptions::stridesCount");
++    static_assert(offsetof(Conv2dOptions, strides) == offsetof(MLConv2dOptions, strides),
++            "offsetof mismatch for Conv2dOptions::strides");
++    static_assert(offsetof(Conv2dOptions, dilationsCount) == offsetof(MLConv2dOptions, dilationsCount),
++            "offsetof mismatch for Conv2dOptions::dilationsCount");
++    static_assert(offsetof(Conv2dOptions, dilations) == offsetof(MLConv2dOptions, dilations),
++            "offsetof mismatch for Conv2dOptions::dilations");
++    static_assert(offsetof(Conv2dOptions, outputPaddingCount) == offsetof(MLConv2dOptions, outputPaddingCount),
++            "offsetof mismatch for Conv2dOptions::outputPaddingCount");
++    static_assert(offsetof(Conv2dOptions, outputPadding) == offsetof(MLConv2dOptions, outputPadding),
++            "offsetof mismatch for Conv2dOptions::outputPadding");
++    static_assert(offsetof(Conv2dOptions, outputSizesCount) == offsetof(MLConv2dOptions, outputSizesCount),
++            "offsetof mismatch for Conv2dOptions::outputSizesCount");
++    static_assert(offsetof(Conv2dOptions, outputSizes) == offsetof(MLConv2dOptions, outputSizes),
++            "offsetof mismatch for Conv2dOptions::outputSizes");
++    static_assert(offsetof(Conv2dOptions, autoPad) == offsetof(MLConv2dOptions, autoPad),
++            "offsetof mismatch for Conv2dOptions::autoPad");
++    static_assert(offsetof(Conv2dOptions, transpose) == offsetof(MLConv2dOptions, transpose),
++            "offsetof mismatch for Conv2dOptions::transpose");
++    static_assert(offsetof(Conv2dOptions, groups) == offsetof(MLConv2dOptions, groups),
++            "offsetof mismatch for Conv2dOptions::groups");
++    static_assert(offsetof(Conv2dOptions, inputLayout) == offsetof(MLConv2dOptions, inputLayout),
++            "offsetof mismatch for Conv2dOptions::inputLayout");
++    static_assert(offsetof(Conv2dOptions, filterLayout) == offsetof(MLConv2dOptions, filterLayout),
++            "offsetof mismatch for Conv2dOptions::filterLayout");
++    static_assert(offsetof(Conv2dOptions, bias) == offsetof(MLConv2dOptions, bias),
++            "offsetof mismatch for Conv2dOptions::bias");
++    static_assert(offsetof(Conv2dOptions, activation) == offsetof(MLConv2dOptions, activation),
++            "offsetof mismatch for Conv2dOptions::activation");
++
++    // GemmOptions
++
++    static_assert(sizeof(GemmOptions) == sizeof(MLGemmOptions), "sizeof mismatch for GemmOptions");
++    static_assert(alignof(GemmOptions) == alignof(MLGemmOptions), "alignof mismatch for GemmOptions");
++
++    static_assert(offsetof(GemmOptions, c) == offsetof(MLGemmOptions, c),
++            "offsetof mismatch for GemmOptions::c");
++    static_assert(offsetof(GemmOptions, alpha) == offsetof(MLGemmOptions, alpha),
++            "offsetof mismatch for GemmOptions::alpha");
++    static_assert(offsetof(GemmOptions, beta) == offsetof(MLGemmOptions, beta),
++            "offsetof mismatch for GemmOptions::beta");
++    static_assert(offsetof(GemmOptions, aTranspose) == offsetof(MLGemmOptions, aTranspose),
++            "offsetof mismatch for GemmOptions::aTranspose");
++    static_assert(offsetof(GemmOptions, bTranspose) == offsetof(MLGemmOptions, bTranspose),
++            "offsetof mismatch for GemmOptions::bTranspose");
++
++    // GruOperators
++
++    static_assert(sizeof(GruOperators) == sizeof(MLGruOperators), "sizeof mismatch for GruOperators");
++    static_assert(alignof(GruOperators) == alignof(MLGruOperators), "alignof mismatch for GruOperators");
++
++    static_assert(offsetof(GruOperators, resetGateActivation) == offsetof(MLGruOperators, resetGateActivation),
++            "offsetof mismatch for GruOperators::resetGateActivation");
++    static_assert(offsetof(GruOperators, newGateActivation) == offsetof(MLGruOperators, newGateActivation),
++            "offsetof mismatch for GruOperators::newGateActivation");
++
++    // InstanceNormOptions
++
++    static_assert(sizeof(InstanceNormOptions) == sizeof(MLInstanceNormOptions), "sizeof mismatch for InstanceNormOptions");
++    static_assert(alignof(InstanceNormOptions) == alignof(MLInstanceNormOptions), "alignof mismatch for InstanceNormOptions");
++
++    static_assert(offsetof(InstanceNormOptions, scale) == offsetof(MLInstanceNormOptions, scale),
++            "offsetof mismatch for InstanceNormOptions::scale");
++    static_assert(offsetof(InstanceNormOptions, bias) == offsetof(MLInstanceNormOptions, bias),
++            "offsetof mismatch for InstanceNormOptions::bias");
++    static_assert(offsetof(InstanceNormOptions, epsilon) == offsetof(MLInstanceNormOptions, epsilon),
++            "offsetof mismatch for InstanceNormOptions::epsilon");
++    static_assert(offsetof(InstanceNormOptions, layout) == offsetof(MLInstanceNormOptions, layout),
++            "offsetof mismatch for InstanceNormOptions::layout");
++
++    // LeakyReluOptions
++
++    static_assert(sizeof(LeakyReluOptions) == sizeof(MLLeakyReluOptions), "sizeof mismatch for LeakyReluOptions");
++    static_assert(alignof(LeakyReluOptions) == alignof(MLLeakyReluOptions), "alignof mismatch for LeakyReluOptions");
++
++    static_assert(offsetof(LeakyReluOptions, alpha) == offsetof(MLLeakyReluOptions, alpha),
++            "offsetof mismatch for LeakyReluOptions::alpha");
++
++    // OperandDescriptor
++
++    static_assert(sizeof(OperandDescriptor) == sizeof(MLOperandDescriptor), "sizeof mismatch for OperandDescriptor");
++    static_assert(alignof(OperandDescriptor) == alignof(MLOperandDescriptor), "alignof mismatch for OperandDescriptor");
++
++    static_assert(offsetof(OperandDescriptor, type) == offsetof(MLOperandDescriptor, type),
++            "offsetof mismatch for OperandDescriptor::type");
++    static_assert(offsetof(OperandDescriptor, dimensions) == offsetof(MLOperandDescriptor, dimensions),
++            "offsetof mismatch for OperandDescriptor::dimensions");
++    static_assert(offsetof(OperandDescriptor, dimensionsCount) == offsetof(MLOperandDescriptor, dimensionsCount),
++            "offsetof mismatch for OperandDescriptor::dimensionsCount");
++
++    // PadOptions
++
++    static_assert(sizeof(PadOptions) == sizeof(MLPadOptions), "sizeof mismatch for PadOptions");
++    static_assert(alignof(PadOptions) == alignof(MLPadOptions), "alignof mismatch for PadOptions");
++
++    static_assert(offsetof(PadOptions, mode) == offsetof(MLPadOptions, mode),
++            "offsetof mismatch for PadOptions::mode");
++    static_assert(offsetof(PadOptions, value) == offsetof(MLPadOptions, value),
++            "offsetof mismatch for PadOptions::value");
++
++    // Pool2dOptions
++
++    static_assert(sizeof(Pool2dOptions) == sizeof(MLPool2dOptions), "sizeof mismatch for Pool2dOptions");
++    static_assert(alignof(Pool2dOptions) == alignof(MLPool2dOptions), "alignof mismatch for Pool2dOptions");
++
++    static_assert(offsetof(Pool2dOptions, windowDimensionsCount) == offsetof(MLPool2dOptions, windowDimensionsCount),
++            "offsetof mismatch for Pool2dOptions::windowDimensionsCount");
++    static_assert(offsetof(Pool2dOptions, windowDimensions) == offsetof(MLPool2dOptions, windowDimensions),
++            "offsetof mismatch for Pool2dOptions::windowDimensions");
++    static_assert(offsetof(Pool2dOptions, paddingCount) == offsetof(MLPool2dOptions, paddingCount),
++            "offsetof mismatch for Pool2dOptions::paddingCount");
++    static_assert(offsetof(Pool2dOptions, padding) == offsetof(MLPool2dOptions, padding),
++            "offsetof mismatch for Pool2dOptions::padding");
++    static_assert(offsetof(Pool2dOptions, stridesCount) == offsetof(MLPool2dOptions, stridesCount),
++            "offsetof mismatch for Pool2dOptions::stridesCount");
++    static_assert(offsetof(Pool2dOptions, strides) == offsetof(MLPool2dOptions, strides),
++            "offsetof mismatch for Pool2dOptions::strides");
++    static_assert(offsetof(Pool2dOptions, dilationsCount) == offsetof(MLPool2dOptions, dilationsCount),
++            "offsetof mismatch for Pool2dOptions::dilationsCount");
++    static_assert(offsetof(Pool2dOptions, dilations) == offsetof(MLPool2dOptions, dilations),
++            "offsetof mismatch for Pool2dOptions::dilations");
++    static_assert(offsetof(Pool2dOptions, autoPad) == offsetof(MLPool2dOptions, autoPad),
++            "offsetof mismatch for Pool2dOptions::autoPad");
++    static_assert(offsetof(Pool2dOptions, layout) == offsetof(MLPool2dOptions, layout),
++            "offsetof mismatch for Pool2dOptions::layout");
++
++    // ReduceOptions
++
++    static_assert(sizeof(ReduceOptions) == sizeof(MLReduceOptions), "sizeof mismatch for ReduceOptions");
++    static_assert(alignof(ReduceOptions) == alignof(MLReduceOptions), "alignof mismatch for ReduceOptions");
++
++    static_assert(offsetof(ReduceOptions, axesCount) == offsetof(MLReduceOptions, axesCount),
++            "offsetof mismatch for ReduceOptions::axesCount");
++    static_assert(offsetof(ReduceOptions, axes) == offsetof(MLReduceOptions, axes),
++            "offsetof mismatch for ReduceOptions::axes");
++    static_assert(offsetof(ReduceOptions, keepDimensions) == offsetof(MLReduceOptions, keepDimensions),
++            "offsetof mismatch for ReduceOptions::keepDimensions");
++
++    // ResampleOptions
++
++    static_assert(sizeof(ResampleOptions) == sizeof(MLResampleOptions), "sizeof mismatch for ResampleOptions");
++    static_assert(alignof(ResampleOptions) == alignof(MLResampleOptions), "alignof mismatch for ResampleOptions");
++
++    static_assert(offsetof(ResampleOptions, mode) == offsetof(MLResampleOptions, mode),
++            "offsetof mismatch for ResampleOptions::mode");
++    static_assert(offsetof(ResampleOptions, scalesCount) == offsetof(MLResampleOptions, scalesCount),
++            "offsetof mismatch for ResampleOptions::scalesCount");
++    static_assert(offsetof(ResampleOptions, scales) == offsetof(MLResampleOptions, scales),
++            "offsetof mismatch for ResampleOptions::scales");
++    static_assert(offsetof(ResampleOptions, sizesCount) == offsetof(MLResampleOptions, sizesCount),
++            "offsetof mismatch for ResampleOptions::sizesCount");
++    static_assert(offsetof(ResampleOptions, sizes) == offsetof(MLResampleOptions, sizes),
++            "offsetof mismatch for ResampleOptions::sizes");
++
++    // SliceOptions
++
++    static_assert(sizeof(SliceOptions) == sizeof(MLSliceOptions), "sizeof mismatch for SliceOptions");
++    static_assert(alignof(SliceOptions) == alignof(MLSliceOptions), "alignof mismatch for SliceOptions");
++
++    static_assert(offsetof(SliceOptions, axesCount) == offsetof(MLSliceOptions, axesCount),
++            "offsetof mismatch for SliceOptions::axesCount");
++    static_assert(offsetof(SliceOptions, axes) == offsetof(MLSliceOptions, axes),
++            "offsetof mismatch for SliceOptions::axes");
++
++    // SplitOptions
++
++    static_assert(sizeof(SplitOptions) == sizeof(MLSplitOptions), "sizeof mismatch for SplitOptions");
++    static_assert(alignof(SplitOptions) == alignof(MLSplitOptions), "alignof mismatch for SplitOptions");
++
++    static_assert(offsetof(SplitOptions, axis) == offsetof(MLSplitOptions, axis),
++            "offsetof mismatch for SplitOptions::axis");
++
++    // SqueezeOptions
++
++    static_assert(sizeof(SqueezeOptions) == sizeof(MLSqueezeOptions), "sizeof mismatch for SqueezeOptions");
++    static_assert(alignof(SqueezeOptions) == alignof(MLSqueezeOptions), "alignof mismatch for SqueezeOptions");
++
++    static_assert(offsetof(SqueezeOptions, axesCount) == offsetof(MLSqueezeOptions, axesCount),
++            "offsetof mismatch for SqueezeOptions::axesCount");
++    static_assert(offsetof(SqueezeOptions, axes) == offsetof(MLSqueezeOptions, axes),
++            "offsetof mismatch for SqueezeOptions::axes");
++
++    // TransposeOptions
++
++    static_assert(sizeof(TransposeOptions) == sizeof(MLTransposeOptions), "sizeof mismatch for TransposeOptions");
++    static_assert(alignof(TransposeOptions) == alignof(MLTransposeOptions), "alignof mismatch for TransposeOptions");
++
++    static_assert(offsetof(TransposeOptions, permutationCount) == offsetof(MLTransposeOptions, permutationCount),
++            "offsetof mismatch for TransposeOptions::permutationCount");
++    static_assert(offsetof(TransposeOptions, permutation) == offsetof(MLTransposeOptions, permutation),
++            "offsetof mismatch for TransposeOptions::permutation");
++
++    // GruOptions
++
++    static_assert(sizeof(GruOptions) == sizeof(MLGruOptions), "sizeof mismatch for GruOptions");
++    static_assert(alignof(GruOptions) == alignof(MLGruOptions), "alignof mismatch for GruOptions");
++
++    static_assert(offsetof(GruOptions, bias) == offsetof(MLGruOptions, bias),
++            "offsetof mismatch for GruOptions::bias");
++    static_assert(offsetof(GruOptions, recurrentBias) == offsetof(MLGruOptions, recurrentBias),
++            "offsetof mismatch for GruOptions::recurrentBias");
++    static_assert(offsetof(GruOptions, initialHiddenState) == offsetof(MLGruOptions, initialHiddenState),
++            "offsetof mismatch for GruOptions::initialHiddenState");
++    static_assert(offsetof(GruOptions, resetAfter) == offsetof(MLGruOptions, resetAfter),
++            "offsetof mismatch for GruOptions::resetAfter");
++    static_assert(offsetof(GruOptions, returnSequence) == offsetof(MLGruOptions, returnSequence),
++            "offsetof mismatch for GruOptions::returnSequence");
++    static_assert(offsetof(GruOptions, direction) == offsetof(MLGruOptions, direction),
++            "offsetof mismatch for GruOptions::direction");
++    static_assert(offsetof(GruOptions, layout) == offsetof(MLGruOptions, layout),
++            "offsetof mismatch for GruOptions::layout");
++    static_assert(offsetof(GruOptions, activations) == offsetof(MLGruOptions, activations),
++            "offsetof mismatch for GruOptions::activations");
++
++    // Input
++
++    static_assert(sizeof(Input) == sizeof(MLInput), "sizeof mismatch for Input");
++    static_assert(alignof(Input) == alignof(MLInput), "alignof mismatch for Input");
++
++    static_assert(offsetof(Input, resource) == offsetof(MLInput, resource),
++            "offsetof mismatch for Input::resource");
++    static_assert(offsetof(Input, dimensions) == offsetof(MLInput, dimensions),
++            "offsetof mismatch for Input::dimensions");
++    static_assert(offsetof(Input, dimensionsCount) == offsetof(MLInput, dimensionsCount),
++            "offsetof mismatch for Input::dimensionsCount");
++
++    // Context
++
++    static_assert(sizeof(Context) == sizeof(MLContext), "sizeof mismatch for Context");
++    static_assert(alignof(Context) == alignof(MLContext), "alignof mismatch for Context");
++
++    bool Context::PopErrorScope(ErrorCallback callback, void * userdata) const {
++        auto result = mlContextPopErrorScope(GetHandle(), callback, reinterpret_cast<void * >(userdata));
++        return result;
++    }
++    void Context::PushErrorScope(ErrorFilter filter) const {
++        mlContextPushErrorScope(GetHandle(), static_cast<MLErrorFilter>(filter));
++    }
++    void Context::SetUncapturedErrorCallback(ErrorCallback callback, void * userdata) const {
++        mlContextSetUncapturedErrorCallback(GetHandle(), callback, reinterpret_cast<void * >(userdata));
++    }
++    void Context::WebnnReference(MLContext handle) {
++        if (handle != nullptr) {
++            mlContextReference(handle);
++        }
++    }
++    void Context::WebnnRelease(MLContext handle) {
++        if (handle != nullptr) {
++            mlContextRelease(handle);
++        }
++    }
++
++    // Graph
++
++    static_assert(sizeof(Graph) == sizeof(MLGraph), "sizeof mismatch for Graph");
++    static_assert(alignof(Graph) == alignof(MLGraph), "alignof mismatch for Graph");
++
++    ComputeGraphStatus Graph::Compute(NamedInputs const& inputs, NamedOutputs const& outputs) const {
++        auto result = mlGraphCompute(GetHandle(), inputs.GetHandle(), outputs.GetHandle());
++        return static_cast<ComputeGraphStatus>(result);
++    }
++    void Graph::WebnnReference(MLGraph handle) {
++        if (handle != nullptr) {
++            mlGraphReference(handle);
++        }
++    }
++    void Graph::WebnnRelease(MLGraph handle) {
++        if (handle != nullptr) {
++            mlGraphRelease(handle);
++        }
++    }
++
++    // GraphBuilder
++
++    static_assert(sizeof(GraphBuilder) == sizeof(MLGraphBuilder), "sizeof mismatch for GraphBuilder");
++    static_assert(alignof(GraphBuilder) == alignof(MLGraphBuilder), "alignof mismatch for GraphBuilder");
++
++    Operand GraphBuilder::Add(Operand const& a, Operand const& b) const {
++        auto result = mlGraphBuilderAdd(GetHandle(), a.GetHandle(), b.GetHandle());
++        return Operand::Acquire(result);
++    }
++    Operand GraphBuilder::AveragePool2d(Operand const& input, Pool2dOptions const * options) const {
++        auto result = mlGraphBuilderAveragePool2d(GetHandle(), input.GetHandle(), reinterpret_cast<MLPool2dOptions const * >(options));
++        return Operand::Acquire(result);
++    }
++    Operand GraphBuilder::BatchNorm(Operand const& input, Operand const& mean, Operand const& variance, BatchNormOptions const * options) const {
++        auto result = mlGraphBuilderBatchNorm(GetHandle(), input.GetHandle(), mean.GetHandle(), variance.GetHandle(), reinterpret_cast<MLBatchNormOptions const * >(options));
++        return Operand::Acquire(result);
++    }
++    Graph GraphBuilder::Build(NamedOperands const& namedOperands) const {
++        auto result = mlGraphBuilderBuild(GetHandle(), namedOperands.GetHandle());
++        return Graph::Acquire(result);
++    }
++    Operand GraphBuilder::Clamp(Operand const& input, ClampOptions const * options) const {
++        auto result = mlGraphBuilderClamp(GetHandle(), input.GetHandle(), reinterpret_cast<MLClampOptions const * >(options));
++        return Operand::Acquire(result);
++    }
++    Operator GraphBuilder::ClampOperator(ClampOptions const * options) const {
++        auto result = mlGraphBuilderClampOperator(GetHandle(), reinterpret_cast<MLClampOptions const * >(options));
++        return Operator::Acquire(result);
++    }
++    Operand GraphBuilder::Concat(uint32_t inputsCount, Operand const * inputs, uint32_t axis) const {
++        auto result = mlGraphBuilderConcat(GetHandle(), inputsCount, reinterpret_cast<MLOperand const * >(inputs), axis);
++        return Operand::Acquire(result);
++    }
++    Operand GraphBuilder::Constant(OperandDescriptor const * desc, ArrayBufferView const * value) const {
++        auto result = mlGraphBuilderConstant(GetHandle(), reinterpret_cast<MLOperandDescriptor const * >(desc), reinterpret_cast<MLArrayBufferView const * >(value));
++        return Operand::Acquire(result);
++    }
++    Operand GraphBuilder::Conv2d(Operand const& input, Operand const& filter, Conv2dOptions const * options) const {
++        auto result = mlGraphBuilderConv2d(GetHandle(), input.GetHandle(), filter.GetHandle(), reinterpret_cast<MLConv2dOptions const * >(options));
++        return Operand::Acquire(result);
++    }
++    Operand GraphBuilder::Div(Operand const& a, Operand const& b) const {
++        auto result = mlGraphBuilderDiv(GetHandle(), a.GetHandle(), b.GetHandle());
++        return Operand::Acquire(result);
++    }
++    Operand GraphBuilder::Gemm(Operand const& a, Operand const& b, GemmOptions const * options) const {
++        auto result = mlGraphBuilderGemm(GetHandle(), a.GetHandle(), b.GetHandle(), reinterpret_cast<MLGemmOptions const * >(options));
++        return Operand::Acquire(result);
++    }
++    OperandArray GraphBuilder::Gru(Operand const& input, Operand const& weight, Operand const& recurrentWeight, int32_t steps, int32_t hiddenSize, GruOptions const * options) const {
++        auto result = mlGraphBuilderGru(GetHandle(), input.GetHandle(), weight.GetHandle(), recurrentWeight.GetHandle(), steps, hiddenSize, reinterpret_cast<MLGruOptions const * >(options));
++        return OperandArray::Acquire(result);
++    }
++    Operand GraphBuilder::HardSwish(Operand const& input) const {
++        auto result = mlGraphBuilderHardSwish(GetHandle(), input.GetHandle());
++        return Operand::Acquire(result);
++    }
++    Operator GraphBuilder::HardSwishOperator() const {
++        auto result = mlGraphBuilderHardSwishOperator(GetHandle());
++        return Operator::Acquire(result);
++    }
++    Operand GraphBuilder::Input(char const * name, OperandDescriptor const * desc) const {
++        auto result = mlGraphBuilderInput(GetHandle(), reinterpret_cast<char const * >(name), reinterpret_cast<MLOperandDescriptor const * >(desc));
++        return Operand::Acquire(result);
++    }
++    Operand GraphBuilder::InstanceNorm(Operand const& input, InstanceNormOptions const * options) const {
++        auto result = mlGraphBuilderInstanceNorm(GetHandle(), input.GetHandle(), reinterpret_cast<MLInstanceNormOptions const * >(options));
++        return Operand::Acquire(result);
++    }
++    Operand GraphBuilder::LeakyRelu(Operand const& input, LeakyReluOptions const * options) const {
++        auto result = mlGraphBuilderLeakyRelu(GetHandle(), input.GetHandle(), reinterpret_cast<MLLeakyReluOptions const * >(options));
++        return Operand::Acquire(result);
++    }
++    Operator GraphBuilder::LeakyReluOperator(LeakyReluOptions const * options) const {
++        auto result = mlGraphBuilderLeakyReluOperator(GetHandle(), reinterpret_cast<MLLeakyReluOptions const * >(options));
++        return Operator::Acquire(result);
++    }
++    Operand GraphBuilder::Matmul(Operand const& a, Operand const& b) const {
++        auto result = mlGraphBuilderMatmul(GetHandle(), a.GetHandle(), b.GetHandle());
++        return Operand::Acquire(result);
++    }
++    Operand GraphBuilder::Max(Operand const& a, Operand const& b) const {
++        auto result = mlGraphBuilderMax(GetHandle(), a.GetHandle(), b.GetHandle());
++        return Operand::Acquire(result);
++    }
++    Operand GraphBuilder::MaxPool2d(Operand const& input, Pool2dOptions const * options) const {
++        auto result = mlGraphBuilderMaxPool2d(GetHandle(), input.GetHandle(), reinterpret_cast<MLPool2dOptions const * >(options));
++        return Operand::Acquire(result);
++    }
++    Operand GraphBuilder::Min(Operand const& a, Operand const& b) const {
++        auto result = mlGraphBuilderMin(GetHandle(), a.GetHandle(), b.GetHandle());
++        return Operand::Acquire(result);
++    }
++    Operand GraphBuilder::Mul(Operand const& a, Operand const& b) const {
++        auto result = mlGraphBuilderMul(GetHandle(), a.GetHandle(), b.GetHandle());
++        return Operand::Acquire(result);
++    }
++    Operand GraphBuilder::Pad(Operand const& input, Operand const& padding, PadOptions const * options) const {
++        auto result = mlGraphBuilderPad(GetHandle(), input.GetHandle(), padding.GetHandle(), reinterpret_cast<MLPadOptions const * >(options));
++        return Operand::Acquire(result);
++    }
++    Operand GraphBuilder::Pow(Operand const& a, Operand const& b) const {
++        auto result = mlGraphBuilderPow(GetHandle(), a.GetHandle(), b.GetHandle());
++        return Operand::Acquire(result);
++    }
++    Operand GraphBuilder::ReduceL1(Operand const& input, ReduceOptions const * options) const {
++        auto result = mlGraphBuilderReduceL1(GetHandle(), input.GetHandle(), reinterpret_cast<MLReduceOptions const * >(options));
++        return Operand::Acquire(result);
++    }
++    Operand GraphBuilder::ReduceL2(Operand const& input, ReduceOptions const * options) const {
++        auto result = mlGraphBuilderReduceL2(GetHandle(), input.GetHandle(), reinterpret_cast<MLReduceOptions const * >(options));
++        return Operand::Acquire(result);
++    }
++    Operand GraphBuilder::ReduceMax(Operand const& input, ReduceOptions const * options) const {
++        auto result = mlGraphBuilderReduceMax(GetHandle(), input.GetHandle(), reinterpret_cast<MLReduceOptions const * >(options));
++        return Operand::Acquire(result);
++    }
++    Operand GraphBuilder::ReduceMean(Operand const& input, ReduceOptions const * options) const {
++        auto result = mlGraphBuilderReduceMean(GetHandle(), input.GetHandle(), reinterpret_cast<MLReduceOptions const * >(options));
++        return Operand::Acquire(result);
++    }
++    Operand GraphBuilder::ReduceMin(Operand const& input, ReduceOptions const * options) const {
++        auto result = mlGraphBuilderReduceMin(GetHandle(), input.GetHandle(), reinterpret_cast<MLReduceOptions const * >(options));
++        return Operand::Acquire(result);
++    }
++    Operand GraphBuilder::ReduceProduct(Operand const& input, ReduceOptions const * options) const {
++        auto result = mlGraphBuilderReduceProduct(GetHandle(), input.GetHandle(), reinterpret_cast<MLReduceOptions const * >(options));
++        return Operand::Acquire(result);
++    }
++    Operand GraphBuilder::ReduceSum(Operand const& input, ReduceOptions const * options) const {
++        auto result = mlGraphBuilderReduceSum(GetHandle(), input.GetHandle(), reinterpret_cast<MLReduceOptions const * >(options));
++        return Operand::Acquire(result);
++    }
++    Operand GraphBuilder::Relu(Operand const& input) const {
++        auto result = mlGraphBuilderRelu(GetHandle(), input.GetHandle());
++        return Operand::Acquire(result);
++    }
++    Operator GraphBuilder::ReluOperator() const {
++        auto result = mlGraphBuilderReluOperator(GetHandle());
++        return Operator::Acquire(result);
++    }
++    Operand GraphBuilder::Resample(Operand const& input, ResampleOptions const * options) const {
++        auto result = mlGraphBuilderResample(GetHandle(), input.GetHandle(), reinterpret_cast<MLResampleOptions const * >(options));
++        return Operand::Acquire(result);
++    }
++    Operand GraphBuilder::Reshape(Operand const& input, int32_t const * newShape, uint32_t newShapeCount) const {
++        auto result = mlGraphBuilderReshape(GetHandle(), input.GetHandle(), reinterpret_cast<int32_t const * >(newShape), newShapeCount);
++        return Operand::Acquire(result);
++    }
++    Operand GraphBuilder::Sigmoid(Operand const& input) const {
++        auto result = mlGraphBuilderSigmoid(GetHandle(), input.GetHandle());
++        return Operand::Acquire(result);
++    }
++    Operator GraphBuilder::SigmoidOperator() const {
++        auto result = mlGraphBuilderSigmoidOperator(GetHandle());
++        return Operator::Acquire(result);
++    }
++    Operand GraphBuilder::Slice(Operand const& input, int32_t const * starts, uint32_t startsCount, int32_t const * sizes, uint32_t sizesCount, SliceOptions const * options) const {
++        auto result = mlGraphBuilderSlice(GetHandle(), input.GetHandle(), reinterpret_cast<int32_t const * >(starts), startsCount, reinterpret_cast<int32_t const * >(sizes), sizesCount, reinterpret_cast<MLSliceOptions const * >(options));
++        return Operand::Acquire(result);
++    }
++    Operand GraphBuilder::Softmax(Operand const& input) const {
++        auto result = mlGraphBuilderSoftmax(GetHandle(), input.GetHandle());
++        return Operand::Acquire(result);
++    }
++    OperandArray GraphBuilder::Split(Operand const& input, uint32_t const * splits, uint32_t splitsCount, SplitOptions const * options) const {
++        auto result = mlGraphBuilderSplit(GetHandle(), input.GetHandle(), reinterpret_cast<uint32_t const * >(splits), splitsCount, reinterpret_cast<MLSplitOptions const * >(options));
++        return OperandArray::Acquire(result);
++    }
++    Operand GraphBuilder::Squeeze(Operand const& input, SqueezeOptions const * options) const {
++        auto result = mlGraphBuilderSqueeze(GetHandle(), input.GetHandle(), reinterpret_cast<MLSqueezeOptions const * >(options));
++        return Operand::Acquire(result);
++    }
++    Operand GraphBuilder::Sub(Operand const& a, Operand const& b) const {
++        auto result = mlGraphBuilderSub(GetHandle(), a.GetHandle(), b.GetHandle());
++        return Operand::Acquire(result);
++    }
++    Operand GraphBuilder::Tanh(Operand const& input) const {
++        auto result = mlGraphBuilderTanh(GetHandle(), input.GetHandle());
++        return Operand::Acquire(result);
++    }
++    Operator GraphBuilder::TanhOperator() const {
++        auto result = mlGraphBuilderTanhOperator(GetHandle());
++        return Operator::Acquire(result);
++    }
++    Operand GraphBuilder::Transpose(Operand const& input, TransposeOptions const * options) const {
++        auto result = mlGraphBuilderTranspose(GetHandle(), input.GetHandle(), reinterpret_cast<MLTransposeOptions const * >(options));
++        return Operand::Acquire(result);
++    }
++    void GraphBuilder::WebnnReference(MLGraphBuilder handle) {
++        if (handle != nullptr) {
++            mlGraphBuilderReference(handle);
++        }
++    }
++    void GraphBuilder::WebnnRelease(MLGraphBuilder handle) {
++        if (handle != nullptr) {
++            mlGraphBuilderRelease(handle);
++        }
++    }
++
++    // NamedInputs
++
++    static_assert(sizeof(NamedInputs) == sizeof(MLNamedInputs), "sizeof mismatch for NamedInputs");
++    static_assert(alignof(NamedInputs) == alignof(MLNamedInputs), "alignof mismatch for NamedInputs");
++
++    void NamedInputs::Set(char const * name, Input const * input) const {
++        mlNamedInputsSet(GetHandle(), reinterpret_cast<char const * >(name), reinterpret_cast<MLInput const * >(input));
++    }
++    void NamedInputs::WebnnReference(MLNamedInputs handle) {
++        if (handle != nullptr) {
++            mlNamedInputsReference(handle);
++        }
++    }
++    void NamedInputs::WebnnRelease(MLNamedInputs handle) {
++        if (handle != nullptr) {
++            mlNamedInputsRelease(handle);
++        }
++    }
++
++    // NamedOperands
++
++    static_assert(sizeof(NamedOperands) == sizeof(MLNamedOperands), "sizeof mismatch for NamedOperands");
++    static_assert(alignof(NamedOperands) == alignof(MLNamedOperands), "alignof mismatch for NamedOperands");
++
++    void NamedOperands::Set(char const * name, Operand const& operand) const {
++        mlNamedOperandsSet(GetHandle(), reinterpret_cast<char const * >(name), operand.GetHandle());
++    }
++    void NamedOperands::WebnnReference(MLNamedOperands handle) {
++        if (handle != nullptr) {
++            mlNamedOperandsReference(handle);
++        }
++    }
++    void NamedOperands::WebnnRelease(MLNamedOperands handle) {
++        if (handle != nullptr) {
++            mlNamedOperandsRelease(handle);
++        }
++    }
++
++    // NamedOutputs
++
++    static_assert(sizeof(NamedOutputs) == sizeof(MLNamedOutputs), "sizeof mismatch for NamedOutputs");
++    static_assert(alignof(NamedOutputs) == alignof(MLNamedOutputs), "alignof mismatch for NamedOutputs");
++
++    void NamedOutputs::Set(char const * name, ArrayBufferView const * resource) const {
++        mlNamedOutputsSet(GetHandle(), reinterpret_cast<char const * >(name), reinterpret_cast<MLArrayBufferView const * >(resource));
++    }
++    void NamedOutputs::WebnnReference(MLNamedOutputs handle) {
++        if (handle != nullptr) {
++            mlNamedOutputsReference(handle);
++        }
++    }
++    void NamedOutputs::WebnnRelease(MLNamedOutputs handle) {
++        if (handle != nullptr) {
++            mlNamedOutputsRelease(handle);
++        }
++    }
++
++    // Operand
++
++    static_assert(sizeof(Operand) == sizeof(MLOperand), "sizeof mismatch for Operand");
++    static_assert(alignof(Operand) == alignof(MLOperand), "alignof mismatch for Operand");
++
++    void Operand::WebnnReference(MLOperand handle) {
++        if (handle != nullptr) {
++            mlOperandReference(handle);
++        }
++    }
++    void Operand::WebnnRelease(MLOperand handle) {
++        if (handle != nullptr) {
++            mlOperandRelease(handle);
++        }
++    }
++
++    // OperandArray
++
++    static_assert(sizeof(OperandArray) == sizeof(MLOperandArray), "sizeof mismatch for OperandArray");
++    static_assert(alignof(OperandArray) == alignof(MLOperandArray), "alignof mismatch for OperandArray");
++
++    Operand OperandArray::Get(size_t index) const {
++        auto result = mlOperandArrayGet(GetHandle(), index);
++        return Operand::Acquire(result);
++    }
++    size_t OperandArray::Size() const {
++        auto result = mlOperandArraySize(GetHandle());
++        return result;
++    }
++    void OperandArray::WebnnReference(MLOperandArray handle) {
++        if (handle != nullptr) {
++            mlOperandArrayReference(handle);
++        }
++    }
++    void OperandArray::WebnnRelease(MLOperandArray handle) {
++        if (handle != nullptr) {
++            mlOperandArrayRelease(handle);
++        }
++    }
++
++    // Operator
++
++    static_assert(sizeof(Operator) == sizeof(MLOperator), "sizeof mismatch for Operator");
++    static_assert(alignof(Operator) == alignof(MLOperator), "alignof mismatch for Operator");
++
++    void Operator::WebnnReference(MLOperator handle) {
++        if (handle != nullptr) {
++            mlOperatorReference(handle);
++        }
++    }
++    void Operator::WebnnRelease(MLOperator handle) {
++        if (handle != nullptr) {
++            mlOperatorRelease(handle);
++        }
++    }
++
++    GraphBuilder CreateGraphBuilder(Context context) {
++        return GraphBuilder::Acquire(webnnCreateGraphBuilder(context.GetHandle()));
++    }
++
++    NamedInputs CreateNamedInputs() {
++        return NamedInputs::Acquire(webnnCreateNamedInputs());
++    }
++
++    NamedOperands CreateNamedOperands() {
++        return NamedOperands::Acquire(webnnCreateNamedOperands());
++    }
++
++    NamedOutputs CreateNamedOutputs() {
++        return NamedOutputs::Acquire(webnnCreateNamedOutputs());
++    }
++
++}
+diff --git a/tools/system_libs.py b/tools/system_libs.py
+index b34b96f4f..8fcaef94c 100644
+--- a/tools/system_libs.py
++++ b/tools/system_libs.py
+@@ -1118,6 +1118,13 @@ class libwebgpu_cpp(MTLibrary):
+   src_dir = ['system', 'lib', 'webgpu']
+   src_files = ['webgpu_cpp.cpp']
+ 
++class libwebnn_cpp(MTLibrary):
++  name = 'libwebnn_cpp'
++
++  cflags = ['-std=c++11', '-O2']
++  src_dir = ['system', 'lib', 'webnn']
++  src_files = ['webnn_cpp.cpp']
++
+ 
+ class libembind(Library):
+   name = 'libembind'
+@@ -1530,6 +1537,9 @@ def calculate(input_files, cxx, forced):
+     if shared.Settings.USE_WEBGPU:
+       add_library(system_libs_map['libwebgpu_cpp'])
+ 
++    if shared.Settings.USE_WEBNN:
++      add_library(system_libs_map['libwebnn_cpp'])
++
+   # When LINKABLE is set the entire link command line is wrapped in --whole-archive by
+   # building.link_ldd.  And since --whole-archive/--no-whole-archive processing does not nest we
+   # shouldn't add any extra `--no-whole-archive` or we will undo the intent of building.link_ldd.
