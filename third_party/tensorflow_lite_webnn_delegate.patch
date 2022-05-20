@@ -1,8 +1,8 @@
 diff --git a/tensorflow/lite/BUILD b/tensorflow/lite/BUILD
-index 70468790e81..9be5a01e589 100644
+index 8414dd7fe67..4e6bcc44d97 100644
 --- a/tensorflow/lite/BUILD
 +++ b/tensorflow/lite/BUILD
-@@ -497,6 +497,18 @@ cc_library(
+@@ -690,6 +690,18 @@ cc_library(
      alwayslink = 1,
  )
  
@@ -22,25 +22,25 @@ index 70468790e81..9be5a01e589 100644
  # WARNING: This build flag is experimental and subject to change.
  config_setting(
 diff --git a/tensorflow/lite/CMakeLists.txt b/tensorflow/lite/CMakeLists.txt
-index f778a464f32..ce54720e2ee 100644
+index 40f9485b5d6..18421043b2c 100644
 --- a/tensorflow/lite/CMakeLists.txt
 +++ b/tensorflow/lite/CMakeLists.txt
-@@ -67,6 +67,7 @@ cmake_dependent_option(TFLITE_ENABLE_NNAPI_VERBOSE_VALIDATION "Enable NNAPI verb
- option(TFLITE_ENABLE_MMAP "Enable MMAP (unsupported on Windows)" ON)
- option(TFLITE_ENABLE_GPU "Enable GPU" OFF)
+@@ -69,6 +69,7 @@ option(TFLITE_ENABLE_GPU "Enable GPU" OFF)
+ option(TFLITE_ENABLE_METAL "Enable Metal delegate (iOS only)" OFF)
  option(TFLITE_ENABLE_XNNPACK "Enable XNNPACK backend" ON)
-+option(TFLITE_ENABLE_WEBNN "Enable WebNN backend" ON)
+ option(TFLITE_ENABLE_EXTERNAL_DELEGATE "Enable External Delegate backend" ON)
++option(TFLITE_ENABLE_WEBNN "Enable WebNN backend" OFF)
  
  option(TFLITE_KERNEL_TEST "Enable tflite kernel unit test" OFF)
- 
-@@ -308,6 +309,17 @@ if(TFLITE_ENABLE_XNNPACK)
+ if(TFLITE_KERNEL_TEST AND ${CMAKE_CROSSCOMPILING})
+@@ -399,6 +400,17 @@ if(TFLITE_ENABLE_XNNPACK)
    )
    list(APPEND TFLITE_TARGET_PUBLIC_OPTIONS "-DTFLITE_BUILD_WITH_XNNPACK_DELEGATE")
  endif()
 +if(TFLITE_ENABLE_WEBNN)
 +  include_directories(
-+    "$ENV{WEBNN_NATIVE_DIR}/gen/src/include"
-+    "$ENV{WEBNN_NATIVE_DIR}/../../src/include"
++    "$ENV{WEBNN_NATIVE_DIR}/out/Release/gen/src/include"
++    "$ENV{WEBNN_NATIVE_DIR}/src/include"
 +  )
 +  populate_tflite_source_vars("delegates/webnn"
 +    TFLITE_DELEGATES_WEBNN_SRCS
@@ -48,25 +48,138 @@ index f778a464f32..ce54720e2ee 100644
 +  )
 +  list(APPEND TFLITE_TARGET_PUBLIC_OPTIONS "-DTFLITE_BUILD_WITH_WEBNN_DELEGATE")
 +endif()
- if (TFLITE_ENABLE_RESOURCE)
-   populate_tflite_source_vars("experimental/resource"
-     TFLITE_EXPERIMENTAL_RESOURCE_SRCS
-@@ -376,6 +388,7 @@ add_library(tensorflow-lite
-   ${TFLITE_DELEGATES_NNAPI_SRCS}
+ if(TFLITE_ENABLE_EXTERNAL_DELEGATE)
+   populate_tflite_source_vars("delegates/external"
+     TFLITE_DELEGATES_EXTERNAL_SRCS
+@@ -475,6 +487,7 @@ add_library(tensorflow-lite
    ${TFLITE_DELEGATES_SRCS}
    ${TFLITE_DELEGATES_XNNPACK_SRCS}
+   ${TFLITE_DELEGATES_EXTERNAL_SRCS}
 +  ${TFLITE_DELEGATES_WEBNN_SRCS}
    ${TFLITE_EXPERIMENTAL_RESOURCE_SRCS}
    ${TFLITE_EXPERIMENTAL_RUY_PROFILER_SRCS}
    ${TFLITE_EXPERIMENTAL_RUY_SRCS}
+diff --git a/tensorflow/lite/delegates/external/BUILD b/tensorflow/lite/delegates/external/BUILD
+index 192091141be..a914f68c672 100644
+--- a/tensorflow/lite/delegates/external/BUILD
++++ b/tensorflow/lite/delegates/external/BUILD
+@@ -13,6 +13,11 @@
+ # limitations under the License.
+ # ==============================================================================
+ 
++load(
++    "//tensorflow/lite:build_def.bzl",
++    "tflite_cc_shared_object",
++)
++
+ package(
+     default_visibility = [
+         "//visibility:public",
+@@ -31,6 +36,31 @@ cc_library(
+     ],
+ )
+ 
++tflite_cc_shared_object(
++    name = "external_delegate_obj",
++    linkopts = select({
++        "//tensorflow:ios": [
++            "-Wl,-exported_symbols_list,$(location //tensorflow/lite/c:exported_symbols.lds)",
++        ],
++        "//tensorflow:macos": [
++            "-Wl,-exported_symbols_list,$(location //tensorflow/lite/c:exported_symbols.lds)",
++        ],
++        "//tensorflow:windows": [
++            "-Wl,-exported_symbols_list,$(location //tensorflow/lite/c:exported_symbols.lds)",
++        ],
++        "//conditions:default": [
++            "-z defs",
++            "-Wl,--version-script,$(location //tensorflow/lite/c:version_script.lds)",
++        ],
++    }),
++    per_os_targets = True,
++    deps = [
++        ":external_delegate",
++        "//tensorflow/lite/c:exported_symbols.lds",
++        "//tensorflow/lite/c:version_script.lds",
++    ],
++)
++
+ exports_files([
+     "external_delegate.h",
+-])
++])
+\ No newline at end of file
+diff --git a/tensorflow/lite/delegates/external/external_delegate.cc b/tensorflow/lite/delegates/external/external_delegate.cc
+index 7fe5c5329dd..8fef8920cbd 100644
+--- a/tensorflow/lite/delegates/external/external_delegate.cc
++++ b/tensorflow/lite/delegates/external/external_delegate.cc
+@@ -154,14 +154,12 @@ ExternalDelegateWrapper::ExternalDelegateWrapper(
+     external_delegate_ = external_lib_.create(ckeys.data(), cvalues.data(),
+                                               ckeys.size(), nullptr);
+     if (external_delegate_) {
+-      wrapper_delegate_ = {
+-          .data_ = reinterpret_cast<void*>(this),
+-          .Prepare = DelegatePrepare,
+-          .CopyFromBufferHandle = nullptr,
+-          .CopyToBufferHandle = nullptr,
+-          .FreeBufferHandle = nullptr,
+-          .flags = external_delegate_->flags,
+-      };
++      wrapper_delegate_.data_ = reinterpret_cast<void*>(this);
++      wrapper_delegate_.Prepare = DelegatePrepare;
++      wrapper_delegate_.CopyFromBufferHandle = nullptr;
++      wrapper_delegate_.CopyToBufferHandle = nullptr;
++      wrapper_delegate_.FreeBufferHandle = nullptr;
++      wrapper_delegate_.flags = external_delegate_->flags;
+       if (external_delegate_->CopyFromBufferHandle) {
+         wrapper_delegate_.CopyFromBufferHandle = DelegateCopyFromBufferHandle;
+       }
+diff --git a/tensorflow/lite/delegates/external/external_delegate.h b/tensorflow/lite/delegates/external/external_delegate.h
+index 9121bd661b4..e15533d2664 100644
+--- a/tensorflow/lite/delegates/external/external_delegate.h
++++ b/tensorflow/lite/delegates/external/external_delegate.h
+@@ -17,6 +17,7 @@ limitations under the License.
+ #define TENSORFLOW_LITE_DELEGATES_EXTERNAL_EXTERNAL_DELEGATE_H_
+ 
+ #include "tensorflow/lite/c/common.h"
++#include "tensorflow/lite/c/c_api_types.h"  // IWYU pragma: export
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -35,20 +36,20 @@ typedef struct TfLiteExternalDelegateOptions {
+ } TfLiteExternalDelegateOptions;
+ 
+ // Insert key/value to the options.
+-TfLiteStatus TfLiteExternalDelegateOptionsInsert(
++TFL_CAPI_EXPORT TfLiteStatus TfLiteExternalDelegateOptionsInsert(
+     TfLiteExternalDelegateOptions* options, const char* key, const char* value);
+ 
+ // Populates TfLiteExternalDelegateOptions with the given shared library path.
+-TfLiteExternalDelegateOptions TfLiteExternalDelegateOptionsDefault(
++TFL_CAPI_EXPORT TfLiteExternalDelegateOptions TfLiteExternalDelegateOptionsDefault(
+     const char* lib_path);
+ 
+ // Creates a new delegate instance that need to be destroyed with
+ // `TfLiteExternalDelegateDelete` when delegate is no longer used by TFLite.
+-TfLiteDelegate* TfLiteExternalDelegateCreate(
++TFL_CAPI_EXPORT TfLiteDelegate* TfLiteExternalDelegateCreate(
+     const TfLiteExternalDelegateOptions* options);
+ 
+ // Destroys a delegate created with `TfLiteExternalDelegateCreate` call.
+-void TfLiteExternalDelegateDelete(TfLiteDelegate* delegate);
++TFL_CAPI_EXPORT void TfLiteExternalDelegateDelete(TfLiteDelegate* delegate);
+ 
+ #ifdef __cplusplus
+ }
 diff --git a/tensorflow/lite/delegates/webnn/BUILD b/tensorflow/lite/delegates/webnn/BUILD
 new file mode 100644
-index 00000000000..1b25e9e87fa
+index 00000000000..c2068aee5d9
 --- /dev/null
 +++ b/tensorflow/lite/delegates/webnn/BUILD
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,187 @@
 +load("//tensorflow/lite:special_rules.bzl", "tflite_portable_test_suite_combined")
 +load("//tensorflow:tensorflow.bzl", "get_compatible_with_portable")
++load("//tensorflow/lite:build_def.bzl", "tflite_cc_shared_object")
 +
 +package(
 +    default_visibility = ["//visibility:public"],
@@ -97,8 +210,46 @@ index 00000000000..1b25e9e87fa
 +        "//tensorflow/lite:util",
 +        "//tensorflow/lite/c:common",
 +        "//tensorflow/lite/schema:schema_fbs",
-+        "//tensorflow/lite/tools/optimize/sparsity:format_converter",
++        "//tensorflow/lite/kernels/internal/utils:sparsity_format_converter",
 +        "@FP16",
++    ],
++)
++
++cc_library(
++    name = "webnn_delegate_adaptor",
++    srcs = ["webnn_delegate_adaptor.cc"],
++    hdrs =  ["webnn_delegate_adaptor.h"],
++    deps = [
++        ":webnn_delegate",
++        "//tensorflow/lite:shared_library",
++        "//tensorflow/lite/c:common",
++        "//tensorflow/lite/tools:command_line_flags",
++        "//tensorflow/lite/tools:logging",
++    ],
++)
++
++tflite_cc_shared_object(
++    name = "webnn_external_delegate_obj",
++    linkopts = select({
++        "//tensorflow:windows": [
++            "-Wl,-exported_symbols_list,$(location //tensorflow/lite/c:exported_symbols.lds)",
++        ],
++        "//conditions:default": [
++            "-Wl,-z,defs",
++            "-Wl,--version-script,$(location //tensorflow/lite:tflite_version_script.lds)",
++        ],
++    }),
++    per_os_targets = True,
++    srcs = select({
++        "//tensorflow:windows": [
++            "webnn_delegate_adaptor.cc",
++        ],
++        "//conditions:default": [],
++    }),
++    deps = [
++        ":webnn_delegate_adaptor",
++        "//tensorflow/lite/c:exported_symbols.lds",
++        "//tensorflow/lite:tflite_version_script.lds",
 +    ],
 +)
 +
@@ -111,13 +262,2598 @@ index 00000000000..1b25e9e87fa
 +        "//tensorflow/lite/c:common",
 +    ],
 +)
-\ No newline at end of file
++
++cc_library(
++    name = "webnn_delegate_test_mode",
++    srcs = ["webnn_delegate.cc"],
++    hdrs = ["webnn_delegate.h"],
++    copts = ["-DWEBNN_DELEGATE_TEST_MODE=1"],
++    linkstatic = True,
++    deps = [
++        "//tensorflow/lite:kernel_api",
++        "//tensorflow/lite:minimal_logging",
++        "//tensorflow/lite:util",
++        "//tensorflow/lite:simple_memory_arena_debug_dump",
++        "//tensorflow/lite/c:common",
++        "//tensorflow/lite/schema:schema_fbs",
++        "//tensorflow/lite/kernels/internal/utils:sparsity_format_converter",
++        "//tensorflow/lite/kernels:padding",
++        "//tensorflow/lite/kernels/internal:compatibility",
++        "//tensorflow/lite/kernels/internal:tensor",
++        "//tensorflow/lite/tools/optimize:reduced_precision_support",
++        "@webnn_native_project//:webnn-native",
++        "@FP16",
++    ],
++)
++
++################################ Tester classes ################################
++
++cc_library(
++    name = "binary_elementwise_tester",
++    testonly = 1,
++    srcs = ["binary_elementwise_tester.cc"],
++    hdrs = ["binary_elementwise_tester.h"],
++    deps = [
++        "//tensorflow/lite:framework",
++        "//tensorflow/lite:schema_fbs_version",
++        "//tensorflow/lite/c:common",
++        "//tensorflow/lite/kernels:builtin_ops",
++        "//tensorflow/lite/schema:schema_conversion_utils",
++        "//tensorflow/lite/schema:schema_fbs",
++        "@FP16",
++        "@com_google_googletest//:gtest",
++        "@flatbuffers",
++    ],
++)
++
++############################## Integration tests ###############################
++
++cc_library(
++    name = "test_main",
++    testonly = 1,
++    linkopts = select({
++        "//tensorflow:emscripten": EMSCRIPTEN_LINKOPTS,
++        "//conditions:default": [],
++    }),
++    deps = [
++        "@com_google_googletest//:gtest_main",
++    ],
++)
++
++cc_test(
++    name = "add_test",
++    srcs = ["add_test.cc"],
++    linkopts = select({
++        "//tensorflow:emscripten": EMSCRIPTEN_LINKOPTS,
++        "//conditions:default": [],
++    }),
++    deps = [
++        ":binary_elementwise_tester",
++        ":test_main",
++        ":webnn_delegate_test_mode",
++        "@com_google_googletest//:gtest",
++    ],
++)
++
++cc_test(
++    name = "delegate_test",
++    srcs = ["delegate_test.cc"],
++    linkopts = select({
++        "//tensorflow:emscripten": EMSCRIPTEN_LINKOPTS,
++        "//conditions:default": [],
++    }),
++    deps = [
++        ":test_main",
++        ":webnn_delegate_test_mode",
++        "@com_google_googletest//:gtest",
++    ],
++)
++
++cc_test(
++    name = "mul_test",
++    srcs = ["mul_test.cc"],
++    linkopts = select({
++        "//tensorflow:emscripten": EMSCRIPTEN_LINKOPTS,
++        "//conditions:default": [],
++    }),
++    deps = [
++        ":binary_elementwise_tester",
++        ":test_main",
++        ":webnn_delegate_test_mode",
++        "@com_google_googletest//:gtest",
++    ],
++)
++
+diff --git a/tensorflow/lite/delegates/webnn/add_test.cc b/tensorflow/lite/delegates/webnn/add_test.cc
+new file mode 100644
+index 00000000000..22a9fbe140e
+--- /dev/null
++++ b/tensorflow/lite/delegates/webnn/add_test.cc
+@@ -0,0 +1,913 @@
++/* Copyright 2022 The TensorFlow Authors. All Rights Reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#include <gtest/gtest.h>
++
++#include <cstdint>
++#include <functional>
++#include <memory>
++#include <random>
++
++#include "tensorflow/lite/delegates/webnn/binary_elementwise_tester.h"
++#include "tensorflow/lite/delegates/webnn/webnn_delegate.h"
++
++namespace tflite {
++namespace webnn {
++
++TEST(Add, 4DBy4D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, 4DBy4DBroadcastChannels) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({1, 1, 1, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({1, 1, 1, channels})
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, 4DBy4DBroadcastWidth) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({1, 1, width, 1})
++      .Input2Shape({batch, height, width, channels})
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({1, 1, width, 1})
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, 4DBy4DBroadcastHeight) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({1, height, 1, 1})
++      .Input2Shape({batch, height, width, channels})
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({1, height, 1, 1})
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, 4DBy4DBroadcastBatch) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, 1, 1, 1})
++      .Input2Shape({batch, height, width, channels})
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, 1, 1, 1})
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, 4DBy4DBroadcastHeightWidthChannels) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({1, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({1, height, width, channels})
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, 4DBy3D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({height, width, channels})
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, 4DBy2D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({width, channels})
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, 4DBy1D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({channels})
++      .Input2Shape({batch, height, width, channels})
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({channels})
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, 4DBy0D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({})
++      .Input2Shape({batch, height, width, channels})
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({})
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, 2DBy2D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, channels})
++      .Input2Shape({batch, channels})
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, 2DBy1D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({channels})
++      .Input2Shape({batch, channels})
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, channels})
++      .Input2Shape({channels})
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, 2DBy0D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({})
++      .Input2Shape({batch, channels})
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, channels})
++      .Input2Shape({})
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, 4DByStatic4D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Input1Static(true)
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Input2Static(true)
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, 4DByStatic4DBroadcastChannels) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({1, 1, 1, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Input1Static(true)
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({1, 1, 1, channels})
++      .Input2Static(true)
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, 4DByStatic4DBroadcastWidth) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({1, 1, width, 1})
++      .Input2Shape({batch, height, width, channels})
++      .Input1Static(true)
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({1, 1, width, 1})
++      .Input2Static(true)
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, 4DByStatic4DBroadcastHeight) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({1, height, 1, 1})
++      .Input2Shape({batch, height, width, channels})
++      .Input1Static(true)
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({1, height, 1, 1})
++      .Input2Static(true)
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, 4DByStatic4DBroadcastBatch) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, 1, 1, 1})
++      .Input2Shape({batch, height, width, channels})
++      .Input1Static(true)
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, 1, 1, 1})
++      .Input2Static(true)
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, 4DByStatic4DBroadcastHeightWidthChannels) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({1, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Input1Static(true)
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({1, height, width, channels})
++      .Input2Static(true)
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, 4DByStatic3D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Input1Static(true)
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({height, width, channels})
++      .Input2Static(true)
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, 4DByStatic2D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Input1Static(true)
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({width, channels})
++      .Input2Static(true)
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, 4DByStatic1D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({channels})
++      .Input2Shape({batch, height, width, channels})
++      .Input1Static(true)
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({channels})
++      .Input2Static(true)
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, 4DByStatic0D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({})
++      .Input2Shape({batch, height, width, channels})
++      .Input1Static(true)
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({})
++      .Input2Static(true)
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, 2DByStatic2D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, channels})
++      .Input2Shape({batch, channels})
++      .Input1Static(true)
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, channels})
++      .Input2Shape({batch, channels})
++      .Input2Static(true)
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, 2DByStatic1D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({channels})
++      .Input2Shape({batch, channels})
++      .Input1Static(true)
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, channels})
++      .Input2Shape({channels})
++      .Input2Static(true)
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, 2DByStatic0D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({})
++      .Input2Shape({batch, channels})
++      .Input1Static(true)
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, channels})
++      .Input2Shape({})
++      .Input2Static(true)
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, FP16Weights) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Input1Static(true)
++      .FP16Weights()
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Input2Static(true)
++      .FP16Weights()
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, SparseWeights) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Input1Static(true)
++      .SparseWeights()
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Input2Static(true)
++      .SparseWeights()
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, ReluActivation) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .ReluActivation()
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, Relu6Activation) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Relu6Activation()
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, ReluMinus1To1Activation) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .ReluMinus1To1Activation()
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, DISABLED_TanhActivation) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .TanhActivation()
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++TEST(Add, DISABLED_SignBitActivation) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .SignBitActivation()
++      .Test(BuiltinOperator_ADD, webnn_delegate.get());
++}
++
++}  // namespace webnn
++}  // namespace tflite
+diff --git a/tensorflow/lite/delegates/webnn/binary_elementwise_tester.cc b/tensorflow/lite/delegates/webnn/binary_elementwise_tester.cc
+new file mode 100644
+index 00000000000..199e213c3a4
+--- /dev/null
++++ b/tensorflow/lite/delegates/webnn/binary_elementwise_tester.cc
+@@ -0,0 +1,415 @@
++/* Copyright 2022 The TensorFlow Authors. All Rights Reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++#include "tensorflow/lite/delegates/webnn/binary_elementwise_tester.h"
++
++#include <array>
++#include <cstdint>
++#include <functional>
++#include <numeric>
++#include <random>
++#include <vector>
++
++#include <gtest/gtest.h>
++#include <fp16.h>
++#include "flatbuffers/flatbuffers.h"  // from @flatbuffers
++#include "tensorflow/lite/interpreter.h"
++#include "tensorflow/lite/kernels/register.h"
++#include "tensorflow/lite/model.h"
++#include "tensorflow/lite/schema/schema_conversion_utils.h"
++#include "tensorflow/lite/schema/schema_generated.h"
++#include "tensorflow/lite/version.h"
++
++namespace tflite {
++namespace webnn {
++
++std::vector<int32_t> BinaryElementwiseTester::OutputShape() const {
++  std::vector<int32_t> output_shape;
++  if (!input1_shape_.empty()) {
++    output_shape.insert(
++        output_shape.end(), input1_shape_.cbegin(),
++        input1_shape_.cbegin() +
++            std::max(input1_shape_.size(), input2_shape_.size()) -
++            input2_shape_.size());
++  }
++  if (!input2_shape_.empty()) {
++    output_shape.insert(
++        output_shape.end(), input2_shape_.cbegin(),
++        input2_shape_.cbegin() +
++            std::max(input2_shape_.size(), input1_shape_.size()) -
++            input1_shape_.size());
++  }
++  for (size_t i = std::min(input1_shape_.size(), input2_shape_.size()); i >= 1;
++       i--) {
++    output_shape.push_back(
++        std::max(*(input1_shape_.cend() - i), *(input2_shape_.cend() - i)));
++  }
++  return output_shape;
++}
++
++void BinaryElementwiseTester::Test(tflite::BuiltinOperator binary_op,
++                                   TfLiteDelegate* delegate) const {
++  if (Input1Static()) {
++    ASSERT_FALSE(Input2Static());
++  }
++  if (FP16Weights()) {
++    ASSERT_TRUE(Input1Static() || Input2Static());
++  }
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  std::uniform_real_distribution<float> input1_distribution(-25.0f, 25.0f);
++  std::uniform_real_distribution<float> input2_distribution(-25.0f, 25.0f);
++  switch (binary_op) {
++    case BuiltinOperator_DIV:
++      input1_distribution = std::uniform_real_distribution<float>(-5.0f, 5.0f);
++      input2_distribution = std::uniform_real_distribution<float>(0.1f, 1.0f);
++      break;
++    case BuiltinOperator_MUL:
++      input1_distribution = std::uniform_real_distribution<float>(-5.0f, 5.0f);
++      input2_distribution = std::uniform_real_distribution<float>(-5.0f, 5.0f);
++      break;
++    default:
++      break;
++  }
++  auto input1_rng = std::bind(input1_distribution, std::ref(rng));
++  auto input2_rng = std::bind(input2_distribution, std::ref(rng));
++
++  std::vector<char> buffer = CreateTfLiteModel(binary_op);
++  const Model* model = GetModel(buffer.data());
++
++  std::unique_ptr<Interpreter> delegate_interpreter;
++  ASSERT_EQ(
++      InterpreterBuilder(
++          model,
++          ::tflite::ops::builtin::BuiltinOpResolverWithoutDefaultDelegates())(
++          &delegate_interpreter),
++      kTfLiteOk);
++  std::unique_ptr<Interpreter> default_interpreter;
++  ASSERT_EQ(
++      InterpreterBuilder(
++          model,
++          ::tflite::ops::builtin::BuiltinOpResolverWithoutDefaultDelegates())(
++          &default_interpreter),
++      kTfLiteOk);
++
++  ASSERT_TRUE(delegate_interpreter);
++  ASSERT_TRUE(default_interpreter);
++
++  if (Input1Static() || Input2Static()) {
++    ASSERT_EQ(delegate_interpreter->inputs().size(), 1);
++    ASSERT_EQ(default_interpreter->inputs().size(), 1);
++  } else {
++    ASSERT_EQ(delegate_interpreter->inputs().size(), 2);
++    ASSERT_EQ(default_interpreter->inputs().size(), 2);
++  }
++
++  ASSERT_EQ(delegate_interpreter->outputs().size(), 1);
++  ASSERT_EQ(default_interpreter->outputs().size(), 1);
++
++  ASSERT_EQ(delegate_interpreter->AllocateTensors(), kTfLiteOk);
++  ASSERT_EQ(default_interpreter->AllocateTensors(), kTfLiteOk);
++
++  ASSERT_EQ(delegate_interpreter->ModifyGraphWithDelegate(delegate), kTfLiteOk);
++
++  if (!Input1Static()) {
++    float* default_input1_data = default_interpreter->typed_tensor<float>(
++        default_interpreter->inputs()[0]);
++    std::generate(default_input1_data,
++                  default_input1_data + ComputeSize(Input1Shape()),
++                  std::ref(input1_rng));
++
++    float* webnn_input1_data = delegate_interpreter->typed_tensor<float>(
++        delegate_interpreter->inputs()[0]);
++    std::copy(default_input1_data,
++              default_input1_data + ComputeSize(Input1Shape()),
++              webnn_input1_data);
++  }
++
++  if (!Input2Static()) {
++    float* default_input2_data = default_interpreter->typed_tensor<float>(
++        default_interpreter->inputs()[Input1Static() ? 0 : 1]);
++    std::generate(default_input2_data,
++                  default_input2_data + ComputeSize(Input2Shape()),
++                  std::ref(input2_rng));
++
++    float* webnn_input2_data = delegate_interpreter->typed_tensor<float>(
++        delegate_interpreter->inputs()[Input1Static() ? 0 : 1]);
++    std::copy(default_input2_data,
++              default_input2_data + ComputeSize(Input2Shape()),
++              webnn_input2_data);
++  }
++
++  ASSERT_EQ(default_interpreter->Invoke(), kTfLiteOk);
++  ASSERT_EQ(delegate_interpreter->Invoke(), kTfLiteOk);
++
++  float* default_output_data = default_interpreter->typed_tensor<float>(
++      default_interpreter->outputs()[0]);
++  float* webnn_output_data = delegate_interpreter->typed_tensor<float>(
++      delegate_interpreter->outputs()[0]);
++
++  for (size_t i = 0; i < ComputeSize(OutputShape()); i++) {
++    ASSERT_NEAR(default_output_data[i], webnn_output_data[i],
++                std::numeric_limits<float>::epsilon() *
++                    std::max(std::abs(default_output_data[i]) * 2.0f, 1.0f));
++  }
++}
++
++std::vector<char> BinaryElementwiseTester::CreateTfLiteModel(
++    tflite::BuiltinOperator binary_op) const {
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  std::uniform_real_distribution<float> input1_distribution(-25.0f, 25.0f);
++  std::uniform_real_distribution<float> input2_distribution(-25.0f, 25.0f);
++  switch (binary_op) {
++    case BuiltinOperator_DIV:
++      input1_distribution = std::uniform_real_distribution<float>(-5.0f, 5.0f);
++      input2_distribution = std::uniform_real_distribution<float>(0.1f, 1.0f);
++      break;
++    case BuiltinOperator_MUL:
++      input1_distribution = std::uniform_real_distribution<float>(-5.0f, 5.0f);
++      input2_distribution = std::uniform_real_distribution<float>(-5.0f, 5.0f);
++      break;
++    default:
++      break;
++  }
++  auto input1_rng = std::bind(input1_distribution, std::ref(rng));
++  auto input2_rng = std::bind(input2_distribution, std::ref(rng));
++
++  flatbuffers::FlatBufferBuilder builder;
++  std::vector<flatbuffers::Offset<OperatorCode>> operator_codes{
++      {CreateOperatorCode(builder, binary_op)}};
++  if (FP16Weights()) {
++    operator_codes.emplace_back(
++        CreateOperatorCode(builder, BuiltinOperator_DEQUANTIZE));
++  } else if (SparseWeights()) {
++    operator_codes.emplace_back(
++        CreateOperatorCode(builder, BuiltinOperator_DENSIFY));
++  }
++
++  std::vector<flatbuffers::Offset<Buffer>> buffers{{
++      CreateBuffer(builder, builder.CreateVector({})),
++  }};
++
++  int32_t input1_buffer = 0;
++  if (Input1Static()) {
++    if (FP16Weights()) {
++      std::vector<uint16_t> input1_data(ComputeSize(Input1Shape()));
++      std::generate(input1_data.begin(), input1_data.end(),
++                    std::bind(fp16_ieee_from_fp32_value, input1_rng));
++
++      buffers.push_back(CreateBuffer(
++          builder, builder.CreateVector(
++                       reinterpret_cast<const uint8_t*>(input1_data.data()),
++                       sizeof(uint16_t) * input1_data.size())));
++    } else {
++      std::vector<float> input1_data(ComputeSize(Input1Shape()));
++      std::generate(input1_data.begin(), input1_data.end(), input1_rng);
++
++      if (!SparseWeights()) {
++        input1_buffer = buffers.size();
++      }
++      buffers.push_back(CreateBuffer(
++          builder, builder.CreateVector(
++                       reinterpret_cast<const uint8_t*>(input1_data.data()),
++                       sizeof(float) * input1_data.size())));
++    }
++  }
++
++  int32_t input2_buffer = 0;
++  if (Input2Static()) {
++    if (FP16Weights()) {
++      std::vector<uint16_t> input2_data(ComputeSize(Input2Shape()));
++      std::generate(input2_data.begin(), input2_data.end(),
++                    std::bind(fp16_ieee_from_fp32_value, input1_rng));
++
++      buffers.push_back(CreateBuffer(
++          builder, builder.CreateVector(
++                       reinterpret_cast<const uint8_t*>(input2_data.data()),
++                       sizeof(uint16_t) * input2_data.size())));
++    } else {
++      std::vector<float> input2_data(ComputeSize(Input2Shape()));
++      std::generate(input2_data.begin(), input2_data.end(), input2_rng);
++
++      if (!SparseWeights()) {
++        input2_buffer = buffers.size();
++      }
++      buffers.push_back(CreateBuffer(
++          builder, builder.CreateVector(
++                       reinterpret_cast<const uint8_t*>(input2_data.data()),
++                       sizeof(float) * input2_data.size())));
++    }
++  }
++
++  const std::vector<int32_t> output_shape = OutputShape();
++  std::vector<flatbuffers::Offset<Tensor>> tensors;
++  std::vector<flatbuffers::Offset<Operator>> operators;
++  if (FP16Weights() && Input1Static()) {
++    tensors.emplace_back(
++        CreateTensor(builder,
++                     builder.CreateVector<int32_t>(Input1Shape().data(),
++                                                   Input1Shape().size()),
++                     TensorType_FLOAT16, 1));
++  } else if (SparseWeights() && Input1Static()) {
++    int dims_count = Input1Shape().size();
++    std::vector<flatbuffers::Offset<DimensionMetadata>> dim_metadata(
++        dims_count);
++    std::vector<int> traversal_order(dims_count);
++    for (int i = 0; i < dims_count; i++) {
++      traversal_order[i] = i;
++      dim_metadata[i] = CreateDimensionMetadata(builder, DimensionType_DENSE,
++                                                Input1Shape()[i]);
++    }
++    flatbuffers::Offset<SparsityParameters> sparsity_param =
++        CreateSparsityParameters(builder, builder.CreateVector(traversal_order),
++                                 0, builder.CreateVector(dim_metadata));
++    tensors.emplace_back(CreateTensor(
++        builder,
++        builder.CreateVector<int32_t>(Input1Shape().data(),
++                                      Input1Shape().size()),
++        TensorType_FLOAT32, /*buffer=*/1, /*name=*/0, /*quantization=*/0,
++        /*is_variable=*/false, /*sparsity=*/sparsity_param));
++  }
++  if (FP16Weights() && Input2Static()) {
++    tensors.emplace_back(
++        CreateTensor(builder,
++                     builder.CreateVector<int32_t>(Input2Shape().data(),
++                                                   Input2Shape().size()),
++                     TensorType_FLOAT16, 1));
++  } else if (SparseWeights() && Input2Static()) {
++    int dims_count = Input2Shape().size();
++    std::vector<flatbuffers::Offset<DimensionMetadata>> dim_metadata(
++        dims_count);
++    std::vector<int> traversal_order(dims_count);
++    for (int i = 0; i < dims_count; i++) {
++      traversal_order[i] = i;
++      dim_metadata[i] = CreateDimensionMetadata(builder, DimensionType_DENSE,
++                                                Input2Shape()[i]);
++    }
++    flatbuffers::Offset<SparsityParameters> sparsity_param =
++        CreateSparsityParameters(builder, builder.CreateVector(traversal_order),
++                                 0, builder.CreateVector(dim_metadata));
++    tensors.emplace_back(CreateTensor(
++        builder,
++        builder.CreateVector<int32_t>(Input2Shape().data(),
++                                      Input2Shape().size()),
++        TensorType_FLOAT32, /*buffer=*/1, /*name=*/0, /*quantization=*/0,
++        /*is_variable=*/false, /*sparsity=*/sparsity_param));
++  }
++  if (FP16Weights()) {
++    const std::array<int32_t, 1> dequantize_inputs{{0}};
++    const std::array<int32_t, 1> dequantize_outputs{{Input1Static() ? 1 : 2}};
++    operators.emplace_back(CreateOperator(
++        builder, /*opcode_index=*/1,
++        builder.CreateVector<int32_t>(dequantize_inputs.data(),
++                                      dequantize_inputs.size()),
++        builder.CreateVector<int32_t>(dequantize_outputs.data(),
++                                      dequantize_outputs.size())));
++  } else if (SparseWeights()) {
++    const std::array<int32_t, 1> densify_inputs{{0}};
++    const std::array<int32_t, 1> densify_outputs{{Input1Static() ? 1 : 2}};
++    operators.emplace_back(
++        CreateOperator(builder, /*opcode_index=*/1,
++                       builder.CreateVector<int32_t>(densify_inputs.data(),
++                                                     densify_inputs.size()),
++                       builder.CreateVector<int32_t>(densify_outputs.data(),
++                                                     densify_outputs.size())));
++  }
++  tensors.emplace_back(CreateTensor(
++      builder,
++      builder.CreateVector<int32_t>(Input1Shape().data(), Input1Shape().size()),
++      TensorType_FLOAT32, input1_buffer));
++  tensors.emplace_back(CreateTensor(
++      builder,
++      builder.CreateVector<int32_t>(Input2Shape().data(), Input2Shape().size()),
++      TensorType_FLOAT32, input2_buffer));
++  tensors.emplace_back(CreateTensor(
++      builder,
++      builder.CreateVector<int32_t>(output_shape.data(), output_shape.size()),
++      TensorType_FLOAT32));
++
++  tflite::BuiltinOptions builtin_options_type = tflite::BuiltinOptions_NONE;
++  flatbuffers::Offset<void> builtin_options = 0;
++  switch (binary_op) {
++    case BuiltinOperator_ADD:
++      builtin_options_type = BuiltinOptions_AddOptions;
++      builtin_options = CreateAddOptions(builder, Activation()).Union();
++      break;
++    case BuiltinOperator_DIV:
++      builtin_options_type = BuiltinOptions_DivOptions;
++      builtin_options = CreateDivOptions(builder, Activation()).Union();
++      break;
++    case BuiltinOperator_MUL:
++      builtin_options_type = BuiltinOptions_MulOptions;
++      builtin_options = CreateMulOptions(builder, Activation()).Union();
++      break;
++    case BuiltinOperator_SUB:
++      builtin_options_type = BuiltinOptions_SubOptions;
++      builtin_options = CreateSubOptions(builder, Activation()).Union();
++      break;
++    default:
++      EXPECT_EQ(Activation(), ActivationFunctionType_NONE);
++  }
++
++  const std::array<int32_t, 2> op_inputs{
++      {static_cast<int>(tensors.size()) - 3,
++       static_cast<int>(tensors.size()) - 2}};
++  const std::array<int32_t, 1> op_outputs{
++      {static_cast<int>(tensors.size()) - 1}};
++  operators.emplace_back(CreateOperator(
++      builder, /*opcode_index=*/0,
++      builder.CreateVector<int32_t>(op_inputs.data(), op_inputs.size()),
++      builder.CreateVector<int32_t>(op_outputs.data(), op_outputs.size()),
++      builtin_options_type, builtin_options));
++
++  std::vector<int32_t> subgraph_inputs;
++  if (!Input1Static()) {
++    subgraph_inputs.push_back(tensors.size() - 3);
++  }
++  if (!Input2Static()) {
++    subgraph_inputs.push_back(tensors.size() - 2);
++  }
++  const std::array<int32_t, 1> subgraph_outputs{
++      {static_cast<int>(tensors.size()) - 1}};
++  flatbuffers::Offset<SubGraph> subgraph = CreateSubGraph(
++      builder, builder.CreateVector(tensors.data(), tensors.size()),
++      builder.CreateVector<int32_t>(subgraph_inputs.data(),
++                                    subgraph_inputs.size()),
++      builder.CreateVector<int32_t>(subgraph_outputs.data(),
++                                    subgraph_outputs.size()),
++      builder.CreateVector(operators.data(), operators.size()));
++
++  flatbuffers::Offset<flatbuffers::String> description =
++      builder.CreateString("Binary operator model");
++
++  flatbuffers::Offset<Model> model_buffer = CreateModel(
++      builder, TFLITE_SCHEMA_VERSION,
++      builder.CreateVector(operator_codes.data(), operator_codes.size()),
++      builder.CreateVector(&subgraph, 1), description,
++      builder.CreateVector(buffers.data(), buffers.size()));
++
++  builder.Finish(model_buffer);
++
++  return std::vector<char>(builder.GetBufferPointer(),
++                           builder.GetBufferPointer() + builder.GetSize());
++}
++
++int32_t BinaryElementwiseTester::ComputeSize(
++    const std::vector<int32_t>& shape) {
++  return std::accumulate(shape.cbegin(), shape.cend(), 1,
++                         std::multiplies<int32_t>());
++}
++
++}  // namespace webnn
++}  // namespace tflite
+diff --git a/tensorflow/lite/delegates/webnn/binary_elementwise_tester.h b/tensorflow/lite/delegates/webnn/binary_elementwise_tester.h
+new file mode 100644
+index 00000000000..07c8381b0c1
+--- /dev/null
++++ b/tensorflow/lite/delegates/webnn/binary_elementwise_tester.h
+@@ -0,0 +1,140 @@
++/* Copyright 2022 The TensorFlow Authors. All Rights Reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#ifndef TENSORFLOW_LITE_DELEGATES_WEBNN_BINARY_ELEMENTWISE_TESTER_H_
++#define TENSORFLOW_LITE_DELEGATES_WEBNN_BINARY_ELEMENTWISE_TESTER_H_
++
++#include <cstdint>
++#include <vector>
++
++#include <gtest/gtest.h>
++#include "tensorflow/lite/c/common.h"
++#include "tensorflow/lite/schema/schema_generated.h"
++
++namespace tflite {
++namespace webnn {
++
++class BinaryElementwiseTester {
++ public:
++  BinaryElementwiseTester() = default;
++  BinaryElementwiseTester(const BinaryElementwiseTester&) = delete;
++  BinaryElementwiseTester& operator=(const BinaryElementwiseTester&) = delete;
++
++  inline BinaryElementwiseTester& Input1Shape(
++      std::initializer_list<int32_t> shape) {
++    for (auto it = shape.begin(); it != shape.end(); ++it) {
++      EXPECT_GT(*it, 0);
++    }
++    input1_shape_ = std::vector<int32_t>(shape.begin(), shape.end());
++    return *this;
++  }
++
++  inline const std::vector<int32_t>& Input1Shape() const {
++    return input1_shape_;
++  }
++
++  inline BinaryElementwiseTester& Input2Shape(
++      std::initializer_list<int32_t> shape) {
++    for (auto it = shape.begin(); it != shape.end(); ++it) {
++      EXPECT_GT(*it, 0);
++    }
++    input2_shape_ = std::vector<int32_t>(shape.begin(), shape.end());
++    return *this;
++  }
++
++  inline const std::vector<int32_t>& Input2Shape() const {
++    return input2_shape_;
++  }
++
++  std::vector<int32_t> OutputShape() const;
++
++  inline BinaryElementwiseTester& Input1Static(bool is_static) {
++    input1_static_ = is_static;
++    return *this;
++  }
++
++  inline bool Input1Static() const { return input1_static_; }
++
++  inline BinaryElementwiseTester& Input2Static(bool is_static) {
++    input2_static_ = is_static;
++    return *this;
++  }
++
++  inline bool Input2Static() const { return input2_static_; }
++
++  inline BinaryElementwiseTester& FP16Weights() {
++    fp16_weights_ = true;
++    return *this;
++  }
++
++  inline bool FP16Weights() const { return fp16_weights_; }
++
++  inline BinaryElementwiseTester& SparseWeights() {
++    sparse_weights_ = true;
++    return *this;
++  }
++
++  inline bool SparseWeights() const { return sparse_weights_; }
++
++  inline BinaryElementwiseTester& ReluActivation() {
++    activation_ = ::tflite::ActivationFunctionType_RELU;
++    return *this;
++  }
++
++  inline BinaryElementwiseTester& Relu6Activation() {
++    activation_ = ::tflite::ActivationFunctionType_RELU6;
++    return *this;
++  }
++
++  inline BinaryElementwiseTester& ReluMinus1To1Activation() {
++    activation_ = ::tflite::ActivationFunctionType_RELU_N1_TO_1;
++    return *this;
++  }
++
++  inline BinaryElementwiseTester& TanhActivation() {
++    activation_ = ::tflite::ActivationFunctionType_TANH;
++    return *this;
++  }
++
++  inline BinaryElementwiseTester& SignBitActivation() {
++    activation_ = ::tflite::ActivationFunctionType_SIGN_BIT;
++    return *this;
++  }
++
++  void Test(tflite::BuiltinOperator binary_op, TfLiteDelegate* delegate) const;
++
++ private:
++  std::vector<char> CreateTfLiteModel(tflite::BuiltinOperator binary_op) const;
++
++  inline ::tflite::ActivationFunctionType Activation() const {
++    return activation_;
++  }
++
++  static int32_t ComputeSize(const std::vector<int32_t>& shape);
++
++  std::vector<int32_t> input1_shape_;
++  std::vector<int32_t> input2_shape_;
++  bool input1_static_ = false;
++  bool input2_static_ = false;
++  bool fp16_weights_ = false;
++  bool sparse_weights_ = false;
++  ::tflite::ActivationFunctionType activation_ =
++      ::tflite::ActivationFunctionType_NONE;
++};
++
++}  // namespace webnn
++}  // namespace tflite
++
++#endif  // TENSORFLOW_LITE_DELEGATES_WEBNN_BINARY_ELEMENTWISE_TESTER_H_
+diff --git a/tensorflow/lite/delegates/webnn/delegate_test.cc b/tensorflow/lite/delegates/webnn/delegate_test.cc
+new file mode 100644
+index 00000000000..1b45801c023
+--- /dev/null
++++ b/tensorflow/lite/delegates/webnn/delegate_test.cc
+@@ -0,0 +1,73 @@
++/* Copyright 2022 The TensorFlow Authors. All Rights Reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#include <gtest/gtest.h>
++
++#include <cstdint>
++#include <functional>
++#include <memory>
++#include <random>
++
++#include "tensorflow/lite/delegates/webnn/webnn_delegate.h"
++
++namespace tflite {
++namespace webnn {
++
++TEST(Delegate, CreateWithDefaultParams) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++}
++
++TEST(Delegate, CreateWithGpuPreferenceParam) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  delegate_options.devicePreference = 1;
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++}
++
++TEST(Delegate, CreateWithCpuPreferenceParam) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  delegate_options.devicePreference = 2;
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++}
++
++TEST(Delegate, CreateWithHighPowerPreferenceParam) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  delegate_options.powerPreference = 2;
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++}
++
++TEST(Delegate, CreateWithLowPowerPreferenceParam) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  delegate_options.powerPreference = 1;
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++}
++
++}  // namespace webnn
++}  // namespace tflite
+diff --git a/tensorflow/lite/delegates/webnn/mul_test.cc b/tensorflow/lite/delegates/webnn/mul_test.cc
+new file mode 100644
+index 00000000000..b0fb851c10e
+--- /dev/null
++++ b/tensorflow/lite/delegates/webnn/mul_test.cc
+@@ -0,0 +1,913 @@
++/* Copyright 2022 The TensorFlow Authors. All Rights Reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#include <gtest/gtest.h>
++
++#include <cstdint>
++#include <functional>
++#include <memory>
++#include <random>
++
++#include "tensorflow/lite/delegates/webnn/binary_elementwise_tester.h"
++#include "tensorflow/lite/delegates/webnn/webnn_delegate.h"
++
++namespace tflite {
++namespace webnn {
++
++TEST(Mul, 4DBy4D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, 4DBy4DBroadcastChannels) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({1, 1, 1, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({1, 1, 1, channels})
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, 4DBy4DBroadcastWidth) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({1, 1, width, 1})
++      .Input2Shape({batch, height, width, channels})
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({1, 1, width, 1})
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, 4DBy4DBroadcastHeight) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({1, height, 1, 1})
++      .Input2Shape({batch, height, width, channels})
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({1, height, 1, 1})
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, 4DBy4DBroadcastBatch) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, 1, 1, 1})
++      .Input2Shape({batch, height, width, channels})
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, 1, 1, 1})
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, 4DBy4DBroadcastHeightWidthChannels) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({1, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({1, height, width, channels})
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, 4DBy3D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({height, width, channels})
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, 4DBy2D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({width, channels})
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, 4DBy1D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({channels})
++      .Input2Shape({batch, height, width, channels})
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({channels})
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, 4DBy0D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({})
++      .Input2Shape({batch, height, width, channels})
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({})
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, 2DBy2D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, channels})
++      .Input2Shape({batch, channels})
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, 2DBy1D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({channels})
++      .Input2Shape({batch, channels})
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, channels})
++      .Input2Shape({channels})
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, 2DBy0D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({})
++      .Input2Shape({batch, channels})
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, channels})
++      .Input2Shape({})
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, 4DByStatic4D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Input1Static(true)
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Input2Static(true)
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, 4DByStatic4DBroadcastChannels) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({1, 1, 1, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Input1Static(true)
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({1, 1, 1, channels})
++      .Input2Static(true)
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, 4DByStatic4DBroadcastWidth) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({1, 1, width, 1})
++      .Input2Shape({batch, height, width, channels})
++      .Input1Static(true)
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({1, 1, width, 1})
++      .Input2Static(true)
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, 4DByStatic4DBroadcastHeight) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({1, height, 1, 1})
++      .Input2Shape({batch, height, width, channels})
++      .Input1Static(true)
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({1, height, 1, 1})
++      .Input2Static(true)
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, 4DByStatic4DBroadcastBatch) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, 1, 1, 1})
++      .Input2Shape({batch, height, width, channels})
++      .Input1Static(true)
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, 1, 1, 1})
++      .Input2Static(true)
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, 4DByStatic4DBroadcastHeightWidthChannels) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({1, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Input1Static(true)
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({1, height, width, channels})
++      .Input2Static(true)
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, 4DByStatic3D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Input1Static(true)
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({height, width, channels})
++      .Input2Static(true)
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, 4DByStatic2D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Input1Static(true)
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({width, channels})
++      .Input2Static(true)
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, 4DByStatic1D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({channels})
++      .Input2Shape({batch, height, width, channels})
++      .Input1Static(true)
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({channels})
++      .Input2Static(true)
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, 4DByStatic0D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({})
++      .Input2Shape({batch, height, width, channels})
++      .Input1Static(true)
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({})
++      .Input2Static(true)
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, 2DByStatic2D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, channels})
++      .Input2Shape({batch, channels})
++      .Input1Static(true)
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, channels})
++      .Input2Shape({batch, channels})
++      .Input2Static(true)
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, 2DByStatic1D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({channels})
++      .Input2Shape({batch, channels})
++      .Input1Static(true)
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, channels})
++      .Input2Shape({channels})
++      .Input2Static(true)
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, 2DByStatic0D) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({})
++      .Input2Shape({batch, channels})
++      .Input1Static(true)
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, channels})
++      .Input2Shape({})
++      .Input2Static(true)
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, FP16Weights) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Input1Static(true)
++      .FP16Weights()
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Input2Static(true)
++      .FP16Weights()
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, SparseWeights) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Input1Static(true)
++      .SparseWeights()
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Input2Static(true)
++      .SparseWeights()
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, ReluActivation) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .ReluActivation()
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, Relu6Activation) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .Relu6Activation()
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, ReluMinus1To1Activation) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .ReluMinus1To1Activation()
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, DISABLED_TanhActivation) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .TanhActivation()
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++TEST(Mul, DISABLED_SignBitActivation) {
++  TfLiteWebNNDelegateOptions delegate_options =
++      TfLiteWebNNDelegateOptionsDefault();
++  std::unique_ptr<TfLiteDelegate, decltype(&TfLiteWebNNDelegateDelete)>
++      webnn_delegate(TfLiteWebNNDelegateCreate(&delegate_options),
++                     TfLiteWebNNDelegateDelete);
++
++  std::random_device random_device;
++  auto rng = std::mt19937(random_device());
++  auto shape_rng =
++      std::bind(std::uniform_int_distribution<int32_t>(2, 5), std::ref(rng));
++  const auto batch = shape_rng();
++  const auto height = shape_rng();
++  const auto width = shape_rng();
++  const auto channels = shape_rng();
++
++  BinaryElementwiseTester()
++      .Input1Shape({batch, height, width, channels})
++      .Input2Shape({batch, height, width, channels})
++      .SignBitActivation()
++      .Test(BuiltinOperator_MUL, webnn_delegate.get());
++}
++
++}  // namespace webnn
++}  // namespace tflite
 diff --git a/tensorflow/lite/delegates/webnn/webnn_delegate.cc b/tensorflow/lite/delegates/webnn/webnn_delegate.cc
 new file mode 100644
-index 00000000000..754df504d28
+index 00000000000..60ff6c9415c
 --- /dev/null
 +++ b/tensorflow/lite/delegates/webnn/webnn_delegate.cc
-@@ -0,0 +1,2255 @@
+@@ -0,0 +1,2733 @@
 +/* Copyright 2021 The TensorFlow Authors. All Rights Reserved.
 +
 +Licensed under the Apache License, Version 2.0 (the "License");
@@ -162,7 +2898,7 @@ index 00000000000..754df504d28
 +#include "tensorflow/lite/c/builtin_op_data.h"
 +#include "tensorflow/lite/c/common.h"
 +#include "tensorflow/lite/minimal_logging.h"
-+#include "tensorflow/lite/tools/optimize/sparsity/format_converter.h"
++#include "tensorflow/lite/kernels/internal/utils/sparsity_format_converter.h"
 +
 +namespace tflite {
 +namespace webnn {
@@ -176,17 +2912,20 @@ index 00000000000..754df504d28
 +
 + public:
 +  explicit Delegate(const TfLiteWebNNDelegateOptions* options) {
-+    context_options_.devicePreference = static_cast<MLDevicePreference>(options->devicePreference);
-+    context_options_.powerPreference = static_cast<MLPowerPreference>(options->powerPreference);
++    context_options_.devicePreference = static_cast<wnn::DevicePreference>(options->devicePreference);
++    context_options_.powerPreference = static_cast<wnn::PowerPreference>(options->powerPreference);
 +    std::unordered_map<uint32_t, std::string> device_preference_names = {
 +        {0, "Default"}, {1, "GPU"}, {2, "CPU"}};
 +    std::unordered_map<uint32_t, std::string> power_preference_names = {
 +        {0, "Default"}, {1, "High-performance"}, {2, "Low-power"}};
++#ifndef __EMSCRIPTEN__
++    instance_ = std::make_unique<webnn_native::Instance>();
++#endif
 +    TFLITE_LOG_PROD_ONCE(tflite::TFLITE_LOG_INFO,
 +                         "Created TensorFlow Lite WebNN delegate for device"
 +                         " %s and power %s.",
-+                         device_preference_names[context_options_.devicePreference].c_str(),
-+                         power_preference_names[context_options_.powerPreference].c_str());
++                         device_preference_names[options->devicePreference].c_str(),
++                         power_preference_names[options->powerPreference].c_str());
 +  }
 +
 +  TfLiteIntArray* PrepareOpsToDelegate(TfLiteContext* context);
@@ -216,7 +2955,10 @@ index 00000000000..754df504d28
 +  // Set of indices of tensors with unpacked static sparse weights.
 +  std::unordered_set<int> static_sparse_weights_;
 +
-+  MLContextOptions context_options_;
++#ifndef __EMSCRIPTEN__
++  std::unique_ptr<webnn_native::Instance> instance_;
++#endif
++  wnn::ContextOptions context_options_;
 +};
 +
 +class Subgraph {
@@ -245,18 +2987,19 @@ index 00000000000..754df504d28
 +
 +    // Create WebNN context and graph builder
 +#ifdef __EMSCRIPTEN__
-+    ml::Context ml_context = emscripten_webnn_create_context(&(delegate->context_options_));
++    wnn::Context wnn_context = emscripten_webnn_create_context(&(delegate->context_options_));
 +#else
 +    WebnnProcTable backend_procs = webnn_native::GetProcs();
 +    webnnProcSetProcs(&backend_procs);
-+    ml::Context ml_context = ml::Context(webnn_native::CreateContext(&(delegate->context_options_)));
++    wnn::Context wnn_context = delegate->instance_->CreateContext(&(delegate->context_options_));
++
 +#endif
-+    if (!ml_context) {
++    if (!wnn_context) {
 +      TF_LITE_KERNEL_LOG(context, "Failed to create WebNN context.");
 +      return nullptr;
 +    }
-+    ml::GraphBuilder ml_builder = ml::CreateGraphBuilder(ml_context);
-+    if (!ml_builder) {
++    wnn::GraphBuilder wnn_builder = wnn::CreateGraphBuilder(wnn_context);
++    if (!wnn_builder) {
 +      TF_LITE_KERNEL_LOG(context, "Failed to create WebNN graph builder.");
 +      return nullptr;
 +    }
@@ -305,6 +3048,15 @@ index 00000000000..754df504d28
 +            tensors[t] = t;
 +          }
 +          break;
++        case kTfLiteBuiltinSplit:
++          // Ignore the first input (axis),
++          // because it is represented as parameters of the WebNN operator
++          // rather than extra input.
++          {
++            const int t = node->inputs->data[1];
++            tensors[t] = t;
++          }
++          break;
 +        default:
 +          // All other operators: process all inputs
 +          for (int k = 0; k < node->inputs->size; k++) {
@@ -335,13 +3087,13 @@ index 00000000000..754df504d28
 +    }
 +
 +    // WebNN operands for TFLite tensors
-+    std::vector<ml::Operand> webnn_operands(tensors.back() + 1);
++    std::vector<wnn::Operand> webnn_operands(tensors.back() + 1);
 +    std::unordered_set<int> compute_inputs;
 +    for (int t : tensors) {
-+      ml::OperandType datatype;
++      wnn::OperandType datatype;
 +      switch (context->tensors[t].type) {
 +        case kTfLiteFloat32:
-+          datatype = ml::OperandType::Float32;
++          datatype = wnn::OperandType::Float32;
 +          break;
 +        default:
 +          TF_LITE_KERNEL_LOG(
@@ -367,21 +3119,21 @@ index 00000000000..754df504d28
 +          &context->tensors[t].dims->data[context->tensors[t].dims->size]);
 +
 +      if (inputs.count(t) != 0 || quasi_static_tensors.count(t) != 0) {
-+        ml::OperandDescriptor desc;
++        wnn::OperandDescriptor desc;
 +        desc.dimensions = dims.data();
 +        desc.dimensionsCount = dims.size();
 +        desc.type = datatype;
 +
-+        ml::Operand operand;
++        wnn::Operand operand;
 +        if (data == nullptr) {
 +          compute_inputs.insert(t);
 +          std::string name = std::to_string(t);
-+          operand = ml_builder.Input(name.c_str(), &desc);
++          operand = wnn_builder.Input(name.c_str(), &desc);
 +        } else {
-+          ml::ArrayBufferView buffer = {const_cast<void*>(data), context->tensors[t].bytes};
++          wnn::ArrayBufferView buffer = {const_cast<void*>(data), context->tensors[t].bytes};
 +          // buffer.buffer = data;
 +          // buffer.byteLength = context->tensors[t].bytes;
-+          operand = ml_builder.Constant(&desc, &buffer);
++          operand = wnn_builder.Constant(&desc, &buffer);
 +        }
 +        webnn_operands[t] = operand;
 +      }
@@ -405,13 +3157,13 @@ index 00000000000..754df504d28
 +        return nullptr;
 +      }
 +
-+      if (VisitNode(ml_builder, context, registration, node, node_index,
++      if (VisitNode(wnn_builder, context, registration, node, node_index,
 +                    quasi_static_tensors, webnn_operands, constant_buffers) != kTfLiteOk) {
 +        return nullptr;
 +      }
 +    }
 +
-+    ml::NamedOperands named_operands = ml::CreateNamedOperands();
++    wnn::NamedOperands named_operands = wnn::CreateNamedOperands();
 +    for (auto o : outputs) {
 +      std::string name = std::to_string(o);
 +      if (!webnn_operands[o]) {
@@ -421,53 +3173,70 @@ index 00000000000..754df504d28
 +      named_operands.Set(name.c_str(), webnn_operands[o]);
 +    }
 +
-+    ml::Graph ml_graph = ml_builder.Build(named_operands);
-+    if (!ml_graph) {
++    wnn::Graph wnn_graph = wnn_builder.Build(named_operands);
++    if (!wnn_graph) {
 +      TF_LITE_KERNEL_LOG(context, "failed to build WebNN graph");
 +      return nullptr;
 +    }
 +
-+    return new Subgraph(ml_graph, std::move(compute_inputs), std::move(outputs));
++    return new Subgraph(wnn_graph, std::move(compute_inputs), std::move(outputs));
 +  }
 +
 +  TfLiteStatus Prepare(TfLiteContext* context) { return kTfLiteOk; }
 +
 +  TfLiteStatus Invoke(TfLiteContext* context) {
-+    ml::NamedInputs named_inputs = ml::CreateNamedInputs();
-+    for (int t : inputs_) {
-+      ml_inputs_[t].resource.buffer = context->tensors[t].data.raw;
-+      ml_inputs_[t].resource.byteLength = context->tensors[t].bytes;
-+      std::string name = std::to_string(t);
-+      named_inputs.Set(name.c_str(), &ml_inputs_[t]);
++    bool any_pointers_changed = false;
++    for (std::pair<int, void*> io_info : externals_) {
++      const TfLiteTensor& tensor = context->tensors[io_info.first];
++      void* data_pointer = &dummy_data_;
++      if (tensor.data.raw != nullptr) {
++        data_pointer = tensor.data.raw;
++      } else {
++        if (tensor.bytes != 0) {
++          TF_LITE_KERNEL_LOG(
++              context, "unexpected null data pointer in external tensor %d",
++              io_info.first);
++          return kTfLiteError;
++        }
++      }
++      if (data_pointer != io_info.second) {
++        any_pointers_changed = true;
++        externals_[io_info.first] = data_pointer;
++      }
 +    }
 +
-+    ml::NamedOutputs named_outputs = ml::CreateNamedOutputs();
-+    for (int t : outputs_) {
-+      ml_outputs_[t].buffer = context->tensors[t].data.raw;
-+      ml_outputs_[t].byteLength = context->tensors[t].bytes;
-+      std::string name = std::to_string(t);
-+      named_outputs.Set(name.c_str(), &ml_outputs_[t]);
++    if (any_pointers_changed) {
++      graph_inputs_ = wnn::CreateNamedInputs();
++      for (int t : inputs_) {
++        wnn_inputs_[t].resource.arrayBufferView.buffer = context->tensors[t].data.raw;
++        wnn_inputs_[t].resource.arrayBufferView.byteLength = context->tensors[t].bytes;
++        std::string name = std::to_string(t);
++        graph_inputs_.Set(name.c_str(), &wnn_inputs_[t]);
++      }
++
++      graph_outputs_ = wnn::CreateNamedOutputs();
++      for (int t : outputs_) {
++        wnn_outputs_[t].arrayBufferView.buffer = context->tensors[t].data.raw;
++        wnn_outputs_[t].arrayBufferView.byteLength = context->tensors[t].bytes;
++        std::string name = std::to_string(t);
++        graph_outputs_.Set(name.c_str(), &wnn_outputs_[t]);
++      }
 +    }
 +
-+    ml::ComputeGraphStatus status = ml_graph_.Compute(named_inputs, named_outputs);
-+    if (status != ml::ComputeGraphStatus::Success) {
-+      TF_LITE_KERNEL_LOG(context, "failed to compute WebNN graph");
-+      return kTfLiteError;
-+    }
-+
++    wnn_graph_.Compute(graph_inputs_, graph_outputs_);
 +    return kTfLiteOk;
 +  }
 +
 +  static TfLiteStatus CalculatePadding(TfLiteContext* context,
-+                                       TfLitePadding padding, ml::AutoPad& auto_pad,
++                                       TfLitePadding padding, wnn::AutoPad& auto_pad,
 +                                       int node_index) {
 +    switch (padding) {
 +      case kTfLitePaddingSame: {
-+        auto_pad = ml::AutoPad::SameUpper;
++        auto_pad = wnn::AutoPad::SameUpper;
 +        return kTfLiteOk;
 +      }
 +      case kTfLitePaddingValid:
-+        auto_pad = ml::AutoPad::Explicit;
++        auto_pad = wnn::AutoPad::Explicit;
 +        return kTfLiteOk;
 +      default:
 +        TF_LITE_MAYBE_KERNEL_LOG(context,
@@ -563,6 +3332,26 @@ index 00000000000..754df504d28
 +    if (params->stride_height <= 0) {
 +      TF_LITE_MAYBE_KERNEL_LOG(context, "invalid stride height %d in node #%d",
 +                               params->stride_height, node_index);
++      return kTfLiteError;
++    }
++
++    return kTfLiteOk;
++  }
++
++  static TfLiteStatus CheckFullyConnectedParams(
++      TfLiteContext* context, const TfLiteFullyConnectedParams* params,
++      int node_index) {
++    if (params->weights_format != kTfLiteFullyConnectedWeightsFormatDefault) {
++      TF_LITE_MAYBE_KERNEL_LOG(
++          context, "unsupported non-default weights format in node #%d",
++          node_index);
++      return kTfLiteError;
++    }
++
++    if (params->asymmetric_quantize_inputs) {
++      TF_LITE_MAYBE_KERNEL_LOG(
++          context, "unsupported asymmetric quantize inputs in node #%d",
++          node_index);
 +      return kTfLiteError;
 +    }
 +
@@ -831,19 +3620,58 @@ index 00000000000..754df504d28
 +    return kTfLiteOk;
 +  }
 +
-+  static ml::Operand BuildClamp(
-+      const ml::GraphBuilder& builder, const ml::Operand& input,
++  static wnn::Operand BuildClamp(
++      const wnn::GraphBuilder& builder, const wnn::Operand& input,
 +      float min_value, float max_value, std::vector<std::unique_ptr<char>>& constant_buffers) {
-+    ml::ClampOptions options;
++    wnn::ClampOptions options;
 +    options.minValue = min_value;
 +    options.maxValue = max_value;
 +    return builder.Clamp(input, &options);
 +  }
 +
++  static wnn::FusionOperator GetClampOperator(
++      const wnn::GraphBuilder& builder, float min_value, float max_value) {
++    wnn::ClampOptions options;
++    options.minValue = min_value;
++    options.maxValue = max_value;
++    return builder.ClampOperator(&options);
++  }
++
++  static TfLiteStatus GetActivation(
++      const wnn::GraphBuilder& builder, TfLiteContext* context, int node_index,
++      TfLiteFusedActivation activation, wnn::FusionOperator& activation_operator) {
++    switch (activation) {
++      case kTfLiteActRelu:
++        activation_operator = builder.ReluOperator();
++        return kTfLiteOk;
++      case kTfLiteActReluN1To1:
++        activation_operator = GetClampOperator(builder, -1.0f, +1.0f);
++        return kTfLiteOk;
++      case kTfLiteActRelu6:
++        activation_operator = GetClampOperator(builder, 0.0f, 6.0f);
++        return kTfLiteOk;
++      case kTfLiteActTanh:
++        activation_operator = builder.TanhOperator();
++        return kTfLiteOk;
++      case kTfLiteActSignBit:
++        TF_LITE_MAYBE_KERNEL_LOG(
++            context, "unsupported fused activation (Sign) in node #%d",
++            node_index);
++        return kTfLiteError;
++      case kTfLiteActSigmoid:
++          activation_operator = builder.SigmoidOperator();
++      default:
++        TF_LITE_MAYBE_KERNEL_LOG(context,
++                                 "invalid fused activation (%d) in node #%d",
++                                 static_cast<int>(activation), node_index);
++        return kTfLiteError;
++    }
++  }
++
 +  static TfLiteStatus VisitActivation(
-+      const ml::GraphBuilder& builder, TfLiteContext* context, int node_index,
++      const wnn::GraphBuilder& builder, TfLiteContext* context, int node_index,
 +      int input_tensor_id, int output_tensor_id, TfLiteFusedActivation activation,
-+      std::vector<ml::Operand>& webnn_operands, std::vector<std::unique_ptr<char>>& constant_buffers) {
++      std::vector<wnn::Operand>& webnn_operands, std::vector<std::unique_ptr<char>>& constant_buffers) {
 +    switch (activation) {
 +      case kTfLiteActNone:
 +        return kTfLiteOk;
@@ -865,20 +3693,20 @@ index 00000000000..754df504d28
 +        }
 +        return kTfLiteOk;
 +      case kTfLiteActTanh:
-+        TF_LITE_MAYBE_KERNEL_LOG(
-+            context, "unsupported fused activation (Tanh) in node #%d",
-+            node_index);
-+        return kTfLiteError;
++        if (builder) {
++          webnn_operands[output_tensor_id] = builder.Tanh(webnn_operands[input_tensor_id]);
++        }
++        return kTfLiteOk;
 +      case kTfLiteActSignBit:
 +        TF_LITE_MAYBE_KERNEL_LOG(
 +            context, "unsupported fused activation (Sign) in node #%d",
 +            node_index);
 +        return kTfLiteError;
 +      case kTfLiteActSigmoid:
-+        TF_LITE_MAYBE_KERNEL_LOG(
-+            context, "unsupported fused activation (Sigmoid) in node #%d",
-+            node_index);
-+        return kTfLiteError;
++        if (builder) {
++          webnn_operands[output_tensor_id] = builder.Sigmoid(webnn_operands[input_tensor_id]);
++        }
++        return kTfLiteOk;
 +      default:
 +        TF_LITE_MAYBE_KERNEL_LOG(context,
 +                                 "invalid fused activation (%d) in node #%d",
@@ -888,10 +3716,10 @@ index 00000000000..754df504d28
 +  }
 +
 +  static TfLiteStatus VisitNode(
-+      const ml::GraphBuilder& builder, TfLiteContext* context,
++      const wnn::GraphBuilder& builder, TfLiteContext* context,
 +      TfLiteRegistration* registration, TfLiteNode* node, int node_index,
 +      const std::unordered_set<int>& quasi_static_tensors,
-+      std::vector<ml::Operand>& webnn_operands,
++      std::vector<wnn::Operand>& webnn_operands,
 +      std::vector<std::unique_ptr<char>>& constant_buffers) {
 +    // TFLite context used for logging purposes. When we create a new node
 +    // (subgraph is non-null), logging context is the same as context, and error
@@ -965,6 +3793,14 @@ index 00000000000..754df504d28
 +                                        node, context->tensors, dwconv_params,
 +                                        quasi_static_tensors, webnn_operands, constant_buffers);
 +      }
++      case kTfLiteBuiltinFullyConnected: {
++        const TfLiteFullyConnectedParams* fc_params =
++            static_cast<const TfLiteFullyConnectedParams*>(node->builtin_data);
++
++        return VisitFullyConnectedNode(builder, logging_context, node_index, node,
++                                       context->tensors, fc_params, quasi_static_tensors,
++                                       webnn_operands, constant_buffers);
++      }
 +      case kTfLiteBuiltinHardSwish:
 +        return VisitHardSwishNode(builder, logging_context, node_index, node,
 +                                  context->tensors, webnn_operands);
@@ -996,6 +3832,23 @@ index 00000000000..754df504d28
 +        return VisitSoftmaxNode(builder, logging_context, node_index, node,
 +                                context->tensors, softmax_params, webnn_operands);
 +      }
++      case kTfLiteBuiltinSplit: {
++        const TfLiteSplitParams* split_params =
++            static_cast<const TfLiteSplitParams*>(node->builtin_data);
++
++        return VisitSplitNode(builder, logging_context, node_index, node,
++                                context->tensors, split_params, webnn_operands);
++      }
++      case kTfLiteBuiltinTanh:
++        return VisitTanhNode(builder, logging_context, node_index, node,
++                             context->tensors, webnn_operands);
++      case kTfLiteBuiltinUnpack: {
++        const TfLiteUnpackParams* unpack_params =
++            static_cast<const TfLiteUnpackParams*>(node->builtin_data);
++
++        return VisitUnpackNode(builder, logging_context, node_index, node,
++                               context->tensors, unpack_params, webnn_operands);
++      }
 +      case kTfLiteBuiltinCustom: {
 +        if (strcmp(registration->custom_name, "Convolution2DTransposeBias") ==
 +            0) {
@@ -1015,10 +3868,10 @@ index 00000000000..754df504d28
 +  }
 +
 +  static TfLiteStatus VisitAddNode(
-+      const ml::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
++      const wnn::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
 +      TfLiteNode* node, const TfLiteTensor* tensors,
 +      const TfLiteAddParams* add_params,
-+      std::vector<ml::Operand>& webnn_operands,
++      std::vector<wnn::Operand>& webnn_operands,
 +      std::vector<std::unique_ptr<char>>& constant_buffers) {
 +    TF_LITE_ENSURE_STATUS(
 +        CheckNumInputsAndOutputs(logging_context, node, 2, 1, node_index));
@@ -1062,10 +3915,10 @@ index 00000000000..754df504d28
 +  }
 +
 +  static TfLiteStatus VisitMulNode(
-+      const ml::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
++      const wnn::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
 +      TfLiteNode* node, const TfLiteTensor* tensors,
 +      const TfLiteMulParams* mul_params,
-+      std::vector<ml::Operand>& webnn_operands,
++      std::vector<wnn::Operand>& webnn_operands,
 +      std::vector<std::unique_ptr<char>>& constant_buffers) {
 +    TF_LITE_ENSURE_STATUS(
 +        CheckNumInputsAndOutputs(logging_context, node, 2, 1, node_index));
@@ -1109,9 +3962,9 @@ index 00000000000..754df504d28
 +  }
 +
 +  static TfLiteStatus VisitPadNode(
-+      const ml::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
++      const wnn::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
 +      TfLiteNode* node, const TfLiteTensor* tensors,
-+      std::vector<ml::Operand>& webnn_operands,
++      std::vector<wnn::Operand>& webnn_operands,
 +      std::vector<std::unique_ptr<char>>& constant_buffers) {
 +    TF_LITE_ENSURE_STATUS(
 +        CheckNumInputsAndOutputs(logging_context, node, 2, 1, node_index));
@@ -1174,10 +4027,10 @@ index 00000000000..754df504d28
 +      std::unique_ptr<char> padding_buffer(new char[padding_buffer_length]);
 +      std::memcpy(padding_buffer.get(), padding.data(), padding_buffer_length);
 +      std::vector<int32_t> dims = {static_cast<int32_t>(rank), 2};
-+      ml::OperandDescriptor desc = {
-+        ml::OperandType::Int32, dims.data(), static_cast<uint32_t>(dims.size())};
-+      ml::ArrayBufferView padding_buffer_view = {padding_buffer.get(), padding_buffer_length};
-+      ml::Operand padding_operand = builder.Constant(&desc, &padding_buffer_view);
++      wnn::OperandDescriptor desc = {
++        wnn::OperandType::Int32, dims.data(), static_cast<uint32_t>(dims.size())};
++      wnn::ArrayBufferView padding_buffer_view = {padding_buffer.get(), padding_buffer_length};
++      wnn::Operand padding_operand = builder.Constant(&desc, &padding_buffer_view);
 +      constant_buffers.push_back(std::move(padding_buffer));
 +
 +      TF_LITE_ENSURE(logging_context, webnn_operands[input_tensor_id]);
@@ -1190,10 +4043,10 @@ index 00000000000..754df504d28
 +  }
 +
 +  static TfLiteStatus VisitAveragePool2DNode(
-+      const ml::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
++      const wnn::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
 +      TfLiteNode* node, const TfLiteTensor* tensors,
 +      const TfLitePoolParams* pool_params,
-+      std::vector<ml::Operand>& webnn_operands,
++      std::vector<wnn::Operand>& webnn_operands,
 +      std::vector<std::unique_ptr<char>>& constant_buffers) {
 +    TF_LITE_ENSURE_STATUS(
 +        CheckNumInputsAndOutputs(logging_context, node, 1, 1, node_index));
@@ -1215,18 +4068,18 @@ index 00000000000..754df504d28
 +    TF_LITE_ENSURE_STATUS(
 +        CheckPoolingParams(logging_context, pool_params, node_index));
 +
-+    ml::AutoPad auto_pad;
++    wnn::AutoPad auto_pad;
 +    TF_LITE_ENSURE_STATUS(CalculatePadding(
 +        logging_context, pool_params->padding, auto_pad, node_index));
 +
 +    if (builder) {
-+      ml::Operand output;
++      wnn::Operand output;
 +      TF_LITE_ENSURE(logging_context, webnn_operands[input_tensor_id]);
 +      if (pool_params->filter_height == 1 && pool_params->filter_width == 1) {
 +        // Only do activation.
 +        output = webnn_operands[input_tensor_id];
 +      } else {
-+        ml::Pool2dOptions options;
++        wnn::Pool2dOptions options;
 +        options.autoPad = auto_pad;
 +        std::vector<int32_t> strides = {
 +            pool_params->stride_height, pool_params->stride_width};
@@ -1236,7 +4089,7 @@ index 00000000000..754df504d28
 +            pool_params->filter_height, pool_params->filter_width};
 +        options.windowDimensions = windowDimensions.data();
 +        options.windowDimensionsCount = windowDimensions.size();
-+        options.layout = ml::InputOperandLayout::Nhwc;
++        options.layout = wnn::InputOperandLayout::Nhwc;
 +        output = builder.AveragePool2d(webnn_operands[input_tensor_id], &options);
 +      }
 +      webnn_operands[output_tensor_id] = output;
@@ -1251,10 +4104,10 @@ index 00000000000..754df504d28
 +  }
 +
 +  static TfLiteStatus VisitMaxPool2DNode(
-+      const ml::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
++      const wnn::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
 +      TfLiteNode* node, const TfLiteTensor* tensors,
 +      const TfLitePoolParams* pool_params,
-+      std::vector<ml::Operand>& webnn_operands,
++      std::vector<wnn::Operand>& webnn_operands,
 +      std::vector<std::unique_ptr<char>>& constant_buffers) {
 +    TF_LITE_ENSURE_STATUS(
 +        CheckNumInputsAndOutputs(logging_context, node, 1, 1, node_index));
@@ -1276,13 +4129,13 @@ index 00000000000..754df504d28
 +    TF_LITE_ENSURE_STATUS(
 +        CheckPoolingParams(logging_context, pool_params, node_index));
 +
-+    ml::AutoPad auto_pad;
++    wnn::AutoPad auto_pad;
 +    TF_LITE_ENSURE_STATUS(CalculatePadding(
 +        logging_context, pool_params->padding, auto_pad, node_index));
 +
 +    if (builder) {
-+      ml::Operand output;
-+      ml::Pool2dOptions options;
++      wnn::Operand output;
++      wnn::Pool2dOptions options;
 +      options.autoPad = auto_pad;
 +      std::vector<int32_t> strides = {
 +          pool_params->stride_height, pool_params->stride_width};
@@ -1292,7 +4145,7 @@ index 00000000000..754df504d28
 +          pool_params->filter_height, pool_params->filter_width};
 +      options.windowDimensions = windowDimensions.data();
 +      options.windowDimensionsCount = windowDimensions.size();
-+      options.layout = ml::InputOperandLayout::Nhwc;
++      options.layout = wnn::InputOperandLayout::Nhwc;
 +      TF_LITE_ENSURE(logging_context, webnn_operands[input_tensor_id]);
 +      output = builder.MaxPool2d(webnn_operands[input_tensor_id], &options);
 +      webnn_operands[output_tensor_id] = output;
@@ -1307,10 +4160,10 @@ index 00000000000..754df504d28
 +  }
 +
 +  static TfLiteStatus VisitMeanNode(
-+      const ml::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
++      const wnn::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
 +      TfLiteNode* node, const TfLiteTensor* tensors,
 +      const TfLiteReducerParams* reducer_params,
-+      std::vector<ml::Operand>& webnn_operands,
++      std::vector<wnn::Operand>& webnn_operands,
 +      std::vector<std::unique_ptr<char>>& constant_buffers) {
 +    TF_LITE_ENSURE_STATUS(
 +        CheckNumInputsAndOutputs(logging_context, node, 2, 1, node_index));
@@ -1367,8 +4220,8 @@ index 00000000000..754df504d28
 +        logging_context, output_tensor, output_tensor_id, node_index));
 +
 +    if (builder) {
-+      ml::Operand output;
-+      ml::ReduceOptions reduceOptions;
++      wnn::Operand output;
++      wnn::ReduceOptions reduceOptions;
 +      reduceOptions.axes = axes_data;
 +      reduceOptions.axesCount = axes_tensor.dims->data[0];
 +      reduceOptions.keepDimensions = reducer_params->keep_dims;
@@ -1382,10 +4235,10 @@ index 00000000000..754df504d28
 +  }
 +
 +  static TfLiteStatus VisitConcatenationNode(
-+      const ml::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
++      const wnn::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
 +      TfLiteNode* node, const TfLiteTensor* tensors,
 +      const TfLiteConcatenationParams* concat_params,
-+      std::vector<ml::Operand>& webnn_operands,
++      std::vector<wnn::Operand>& webnn_operands,
 +      std::vector<std::unique_ptr<char>>& constant_buffers) {
 +    size_t input_size = node->inputs->size;
 +    const TfLiteTensor& first_input_tensor = tensors[node->inputs->data[0]];
@@ -1393,12 +4246,12 @@ index 00000000000..754df504d28
 +                     ? first_input_tensor.dims->size + concat_params->axis
 +                     : concat_params->axis;
 +    if (builder) {
-+      std::vector<ml::Operand> input_operands;
++      std::vector<wnn::Operand> input_operands;
 +      for (size_t i = 0; i < input_size; ++i) {
 +        TF_LITE_ENSURE(logging_context, webnn_operands[node->inputs->data[i]]);
 +        input_operands.push_back(webnn_operands[node->inputs->data[i]]);
 +      }
-+      ml::Operand output_operand = builder.Concat(input_operands.size(), input_operands.data(), axis);
++      wnn::Operand output_operand = builder.Concat(input_operands.size(), input_operands.data(), axis);
 +      webnn_operands[node->outputs->data[0]] = output_operand;
 +      TF_LITE_ENSURE(logging_context, webnn_operands[node->outputs->data[0]]);
 +    }
@@ -1406,11 +4259,11 @@ index 00000000000..754df504d28
 +  }
 +
 +  static TfLiteStatus VisitConv2DNode(
-+      const ml::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
++      const wnn::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
 +      TfLiteNode* node, const TfLiteTensor* tensors,
 +      const TfLiteConvParams* conv_params,
 +      const std::unordered_set<int>& quasi_static_tensors,
-+      std::vector<ml::Operand>& webnn_operands,
++      std::vector<wnn::Operand>& webnn_operands,
 +      std::vector<std::unique_ptr<char>>& constant_buffers) {
 +    TF_LITE_ENSURE_STATUS(
 +        CheckConvolutionParams(logging_context, conv_params, node_index));
@@ -1461,12 +4314,12 @@ index 00000000000..754df504d28
 +    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
 +        logging_context, output_tensor, output_tensor_id, node_index));
 +
-+    ml::AutoPad auto_pad;
++    wnn::AutoPad auto_pad;
 +    TF_LITE_ENSURE_STATUS(CalculatePadding(
 +        logging_context, conv_params->padding, auto_pad, node_index));
 +
 +    if (builder) {
-+      ml::Conv2dOptions options;
++      wnn::Conv2dOptions options;
 +      options.autoPad = auto_pad;
 +      std::vector<int32_t> strides = {
 +          conv_params->stride_height, conv_params->stride_width};
@@ -1476,35 +4329,37 @@ index 00000000000..754df504d28
 +          conv_params->dilation_height_factor, conv_params->dilation_width_factor};
 +      options.dilations = dilations.data();
 +      options.dilationsCount = dilations.size();
-+      options.inputLayout = ml::InputOperandLayout::Nhwc;
-+      options.filterLayout = ml::FilterOperandLayout::Ohwi;
++      options.inputLayout = wnn::InputOperandLayout::Nhwc;
++      options.filterLayout = wnn::Conv2dFilterOperandLayout::Ohwi;
 +      TF_LITE_ENSURE(logging_context, webnn_operands[input_tensor_id]);
 +      TF_LITE_ENSURE(logging_context, webnn_operands[filter_tensor_id]);
-+      ml::Operand output =
-+          builder.Conv2d(webnn_operands[input_tensor_id], 
-+                         webnn_operands[filter_tensor_id],
-+                         &options);
 +      if (bias_tensor_id >= 0) {
 +        TF_LITE_ENSURE(logging_context, webnn_operands[bias_tensor_id]);
-+        output = builder.Add(output, webnn_operands[bias_tensor_id]);
++        options.bias = webnn_operands[bias_tensor_id];
 +      }
++      wnn::FusionOperator activation_operator;
++      if (conv_params->activation != kTfLiteActNone) {
++        TF_LITE_ENSURE_STATUS(GetActivation(builder, logging_context, node_index,
++            conv_params->activation, activation_operator));
++        options.activation = activation_operator;
++      }
++      wnn::Operand output =
++          builder.Conv2d(webnn_operands[input_tensor_id],
++                         webnn_operands[filter_tensor_id],
++                         &options);
 +      webnn_operands[output_tensor_id] = output;
 +      TF_LITE_ENSURE(logging_context, webnn_operands[output_tensor_id]);
 +    }
-+
-+    TF_LITE_ENSURE_STATUS(VisitActivation(
-+          builder, logging_context, node_index, output_tensor_id, output_tensor_id,
-+          conv_params->activation, webnn_operands, constant_buffers));
 +
 +    return kTfLiteOk;
 +  }
 +
 +  static TfLiteStatus VisitMediaPipeDeconvolutionNode(
-+      const ml::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
++      const wnn::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
 +      TfLiteNode* node, const TfLiteTensor* tensors,
 +      const TfLiteTransposeConvParams* deconv_params,
 +      const std::unordered_set<int>& quasi_static_tensors,
-+      std::vector<ml::Operand>& webnn_operands) {
++      std::vector<wnn::Operand>& webnn_operands) {
 +    TF_LITE_ENSURE_STATUS(
 +        CheckNumInputsAndOutputs(logging_context, node, 3, 1, node_index));
 +
@@ -1556,30 +4411,29 @@ index 00000000000..754df504d28
 +    TF_LITE_ENSURE_STATUS(CheckMediaPipeTransposedConvolutionParams(
 +        logging_context, deconv_params, node_index));
 +
-+    ml::AutoPad auto_pad;
++    wnn::AutoPad auto_pad;
 +    TF_LITE_ENSURE_STATUS(CalculatePadding(
 +        logging_context, deconv_params->padding, auto_pad, node_index));
 +
 +    if (builder) {
-+      ml::Conv2dOptions options;
-+      options.transpose = true;
++      wnn::ConvTranspose2dOptions options;
 +      options.autoPad = auto_pad;
 +      std::vector<int32_t> strides = {
 +          deconv_params->stride_height, deconv_params->stride_width};
 +      options.strides = strides.data();
 +      options.stridesCount = strides.size();
-+      options.inputLayout = ml::InputOperandLayout::Nhwc;
-+      options.filterLayout = ml::FilterOperandLayout::Ohwi;
++      options.inputLayout = wnn::InputOperandLayout::Nhwc;
++      options.filterLayout = wnn::ConvTranspose2dFilterOperandLayout::Ohwi;
 +      TF_LITE_ENSURE(logging_context, webnn_operands[input_tensor_id]);
 +      TF_LITE_ENSURE(logging_context, webnn_operands[filter_tensor_id]);
-+      ml::Operand output =
-+          builder.Conv2d(webnn_operands[input_tensor_id], 
-+                         webnn_operands[filter_tensor_id],
-+                         &options);
 +      if (bias_tensor_id >= 0) {
 +        TF_LITE_ENSURE(logging_context, webnn_operands[bias_tensor_id]);
-+        output = builder.Add(output, webnn_operands[bias_tensor_id]);
++        options.bias = webnn_operands[bias_tensor_id];
 +      }
++      wnn::Operand output =
++          builder.ConvTranspose2d(webnn_operands[input_tensor_id],
++                         webnn_operands[filter_tensor_id],
++                         &options);
 +      webnn_operands[output_tensor_id] = output;
 +      TF_LITE_ENSURE(logging_context, webnn_operands[output_tensor_id]);
 +    }
@@ -1588,11 +4442,11 @@ index 00000000000..754df504d28
 +  }
 +
 +  static TfLiteStatus VisitDepthwiseConv2DNode(
-+      const ml::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
++      const wnn::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
 +      TfLiteNode* node, const TfLiteTensor* tensors,
 +      const TfLiteDepthwiseConvParams* dwconv_params,
 +      const std::unordered_set<int>& quasi_static_tensors,
-+      std::vector<ml::Operand>& webnn_operands,
++      std::vector<wnn::Operand>& webnn_operands,
 +      std::vector<std::unique_ptr<char>>& constant_buffers) {
 +    TF_LITE_ENSURE_STATUS(
 +        CheckNumInputsAndOutputs(logging_context, node, 3, 1, node_index));
@@ -1644,12 +4498,12 @@ index 00000000000..754df504d28
 +    TF_LITE_ENSURE_STATUS(CheckDepthwiseConvolutionParams(
 +        logging_context, dwconv_params, output_channels, node_index));
 +
-+    ml::AutoPad auto_pad;
++    wnn::AutoPad auto_pad;
 +    TF_LITE_ENSURE_STATUS(CalculatePadding(
 +        logging_context, dwconv_params->padding, auto_pad, node_index));
 +
 +    if (builder) {
-+      ml::Conv2dOptions options;
++      wnn::Conv2dOptions options;
 +      options.autoPad = auto_pad;
 +      std::vector<int32_t> strides = {
 +          dwconv_params->stride_height, dwconv_params->stride_width};
@@ -1659,34 +4513,203 @@ index 00000000000..754df504d28
 +          dwconv_params->dilation_height_factor, dwconv_params->dilation_width_factor};
 +      options.dilations = dilations.data();
 +      options.dilationsCount = dilations.size();
-+      options.inputLayout = ml::InputOperandLayout::Nhwc;
-+      options.filterLayout = ml::FilterOperandLayout::Ihwo;
++      options.inputLayout = wnn::InputOperandLayout::Nhwc;
++      options.filterLayout = wnn::Conv2dFilterOperandLayout::Ihwo;
 +      options.groups = output_channels / dwconv_params->depth_multiplier;
 +      TF_LITE_ENSURE(logging_context, webnn_operands[input_tensor_id]);
 +      TF_LITE_ENSURE(logging_context, webnn_operands[filter_tensor_id]);
-+      ml::Operand output =
++
++      if (bias_tensor_id >= 0) {
++        TF_LITE_ENSURE(logging_context, webnn_operands[bias_tensor_id]);
++        options.bias = webnn_operands[bias_tensor_id];
++      }
++      wnn::FusionOperator activation_operator;
++      if (dwconv_params->activation != kTfLiteActNone) {
++        TF_LITE_ENSURE_STATUS(GetActivation(builder, logging_context, node_index,
++            dwconv_params->activation, activation_operator));
++        options.activation = activation_operator;
++      }
++      wnn::Operand output =
 +          builder.Conv2d(webnn_operands[input_tensor_id],
 +                         webnn_operands[filter_tensor_id],
 +                         &options);
++      webnn_operands[output_tensor_id] = output;
++      TF_LITE_ENSURE(logging_context, webnn_operands[output_tensor_id]);
++    }
++
++    return kTfLiteOk;
++  }
++
++  static TfLiteStatus VisitFullyConnectedNode(
++      const wnn::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
++      TfLiteNode* node, const TfLiteTensor* tensors,
++      const TfLiteFullyConnectedParams* fc_params,
++      const std::unordered_set<int>& quasi_static_tensors,
++      std::vector<wnn::Operand>& webnn_operands,
++      std::vector<std::unique_ptr<char>>& constant_buffers) {
++    TF_LITE_ENSURE_STATUS(
++        CheckFullyConnectedParams(logging_context, fc_params, node_index));
++    TF_LITE_ENSURE_STATUS(
++        CheckNumInputsAndOutputs(logging_context, node, 2, 3, 1, node_index));
++
++    const int input_tensor_id = node->inputs->data[0];
++    const TfLiteTensor& input_tensor = tensors[input_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32OrQInt8Type(
++        logging_context, input_tensor, input_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, input_tensor, input_tensor_id, node_index));
++
++    const int filter_tensor_id = node->inputs->data[1];
++    const TfLiteTensor& filter_tensor = tensors[filter_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32OrQInt8Type(
++        logging_context, filter_tensor, filter_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorShape(logging_context, filter_tensor, 2,
++                                           filter_tensor_id));
++    if (quasi_static_tensors.count(filter_tensor_id) == 0) {
++      TF_LITE_ENSURE_STATUS(CheckTensorStaticAllocation(
++          logging_context, filter_tensor, filter_tensor_id, node_index));
++    }
++
++    int bias_tensor_id = -1;
++    if (node->inputs->size >= 3) {
++      bias_tensor_id = node->inputs->data[2];
++      if (bias_tensor_id >= 0) {
++        const TfLiteTensor& bias_tensor = tensors[bias_tensor_id];
++        TF_LITE_ENSURE_STATUS(CheckTensorFloat32OrQInt32Type(
++            logging_context, bias_tensor, bias_tensor_id, node_index));
++        TF_LITE_ENSURE_STATUS(CheckTensorShape(logging_context, bias_tensor, 1,
++                                               bias_tensor_id));
++        if (quasi_static_tensors.count(bias_tensor_id) == 0) {
++          TF_LITE_ENSURE_STATUS(CheckTensorStaticAllocation(
++              logging_context, bias_tensor, bias_tensor_id, node_index));
++        }
++      }
++    }
++
++    const int output_tensor_id = node->outputs->data[0];
++    const TfLiteTensor& output_tensor = tensors[output_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32OrQInt8Type(
++        logging_context, output_tensor, output_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, output_tensor, output_tensor_id, node_index));
++
++    const int32_t output_channels = filter_tensor.dims->data[0];
++    const int32_t input_channels = filter_tensor.dims->data[1];
++
++    if (input_tensor.dims->size == 0) {
++      TF_LITE_MAYBE_KERNEL_LOG(
++          logging_context,
++          "unexpected number of shape dimensions %d in tensor #%d",
++          input_tensor.dims->size, input_tensor_id);
++      return kTfLiteError;
++    }
++    const int32_t * input_dims_data = input_tensor.dims->data;
++    int32_t num_input_elements = 1;
++    for (int i = 0; i < input_tensor.dims->size; i++) {
++      if (input_dims_data[i] <= 0) {
++        TF_LITE_MAYBE_KERNEL_LOG(
++            logging_context, "invalid dimension #%d (%d) in tensor #%d", i,
++            input_dims_data[i], input_tensor_id);
++        return kTfLiteError;
++      }
++      num_input_elements *= input_dims_data[i];
++    }
++
++    if (fc_params->keep_num_dims) {
++      TF_LITE_ENSURE_STATUS(CheckTensorShape(logging_context, output_tensor,
++                                             input_tensor.dims->size,
++                                             output_tensor_id));
++
++      for (int i = 0; i < input_tensor.dims->size - 1; i++) {
++        if (input_dims_data[i] != output_tensor.dims->data[i]) {
++          TF_LITE_MAYBE_KERNEL_LOG(
++              logging_context,
++              "mismatch in shape dimension %d (%d != %d) in input and output "
++              "tensors of FULLY_CONNECTED operator #%d",
++              i, input_dims_data[i], output_tensor.dims->data[i],
++              node_index);
++          return kTfLiteError;
++        }
++      }
++    } else {
++      if (num_input_elements % input_channels != 0) {
++        TF_LITE_MAYBE_KERNEL_LOG(
++            logging_context,
++            "number of elements in input tensor #%d in FULLY_CONNECTED "
++            "operator is not divisible by input channels (%d)",
++            input_tensor_id, input_channels);
++        return kTfLiteError;
++      }
++
++      TF_LITE_ENSURE_STATUS(CheckTensorShape(logging_context, output_tensor, 2,
++                                             output_tensor_id));
++
++      if (output_tensor.dims->data[0] != num_input_elements / input_channels) {
++        TF_LITE_MAYBE_KERNEL_LOG(
++            logging_context,
++            "batch size %d in output tensor #%d in FULLY_CONNECTED operator "
++            "does not match batch size %d in reshaped input tensor #%d",
++            output_tensor.dims->data[0], output_tensor_id,
++            num_input_elements / input_channels, input_tensor_id);
++        return kTfLiteError;
++      }
++    }
++
++    if (output_tensor.dims->data[output_tensor.dims->size - 1] !=
++        output_channels) {
++      TF_LITE_MAYBE_KERNEL_LOG(
++          logging_context,
++          "number of channels %d in output tensor #%d does not match output "
++          "channels %d in filter tensor #%d",
++          output_tensor.dims->data[output_tensor.dims->size - 1],
++          output_tensor_id, output_channels, filter_tensor_id);
++      return kTfLiteError;
++    }
++
++    if (builder) {
++      wnn::GemmOptions options;
++      options.aTranspose = false;
++      options.bTranspose = true;
 +      if (bias_tensor_id >= 0) {
 +        TF_LITE_ENSURE(logging_context, webnn_operands[bias_tensor_id]);
-+        output = builder.Add(output, webnn_operands[bias_tensor_id]);
++        options.c = webnn_operands[bias_tensor_id];
 +      }
++      TF_LITE_ENSURE(logging_context, webnn_operands[input_tensor_id]);
++      TF_LITE_ENSURE(logging_context, webnn_operands[filter_tensor_id]);
++      wnn::Operand output;
++      if (fc_params->keep_num_dims || input_tensor.dims->size > 2) {
++        // Reshape input to 2D tensor
++        const int32_t n_inputs =
++            static_cast<const int32_t>(input_dims_data[input_tensor.dims->size -1]);
++        std::vector<int32_t> new_input_shape = {-1, n_inputs};
++        wnn::Operand reshaped_input =
++            builder.Reshape(webnn_operands[input_tensor_id],
++                            new_input_shape.data(), new_input_shape.size());
++        wnn::Operand gemm = builder.Gemm(reshaped_input,
++                                        webnn_operands[filter_tensor_id],
++                                        &options);
++        output = builder.Reshape(gemm, &output_tensor.dims->data[0],
++                                 output_tensor.dims->size);
++      } else {
++        output = builder.Gemm(webnn_operands[input_tensor_id],
++                              webnn_operands[filter_tensor_id], &options);
++      }
++
 +      webnn_operands[output_tensor_id] = output;
 +      TF_LITE_ENSURE(logging_context, webnn_operands[output_tensor_id]);
 +    }
 +
 +    TF_LITE_ENSURE_STATUS(VisitActivation(
 +        builder, logging_context, node_index, output_tensor_id, output_tensor_id,
-+        dwconv_params->activation, webnn_operands, constant_buffers));
++        fc_params->activation, webnn_operands, constant_buffers));
 +
 +    return kTfLiteOk;
 +  }
 +
 +  static TfLiteStatus VisitHardSwishNode(
-+      const ml::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
++      const wnn::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
 +      TfLiteNode* node, const TfLiteTensor* tensors,
-+      std::vector<ml::Operand>& webnn_operands) {
++      std::vector<wnn::Operand>& webnn_operands) {
 +    TF_LITE_ENSURE_STATUS(
 +        CheckNumInputsAndOutputs(logging_context, node, 1, 1, node_index));
 +
@@ -1712,9 +4735,9 @@ index 00000000000..754df504d28
 +  }
 +
 +  static TfLiteStatus VisitLogisticNode(
-+      const ml::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
++      const wnn::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
 +      TfLiteNode* node, const TfLiteTensor* tensors,
-+      std::vector<ml::Operand>& webnn_operands) {
++      std::vector<wnn::Operand>& webnn_operands) {
 +    TF_LITE_ENSURE_STATUS(
 +        CheckNumInputsAndOutputs(logging_context, node, 1, 1, node_index));
 +
@@ -1740,9 +4763,9 @@ index 00000000000..754df504d28
 +  }
 +
 +  static TfLiteStatus VisitReluNode(
-+      const ml::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
++      const wnn::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
 +      TfLiteNode* node, const TfLiteTensor* tensors,
-+      std::vector<ml::Operand>& webnn_operands) {
++      std::vector<wnn::Operand>& webnn_operands) {
 +    TF_LITE_ENSURE_STATUS(
 +        CheckNumInputsAndOutputs(logging_context, node, 1, 1, node_index));
 +
@@ -1768,10 +4791,10 @@ index 00000000000..754df504d28
 +  }
 +
 +  static TfLiteStatus VisitReshapeNode(
-+      const ml::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
++      const wnn::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
 +      TfLiteNode* node, const TfLiteTensor* tensors,
 +      const TfLiteReshapeParams* reshape_params,
-+      std::vector<ml::Operand>& webnn_operands) {
++      std::vector<wnn::Operand>& webnn_operands) {
 +    switch (node->inputs->size) {
 +      case 1:
 +      case 2:
@@ -1829,10 +4852,10 @@ index 00000000000..754df504d28
 +  }
 +
 +  static TfLiteStatus VisitResizeBilinearNode(
-+      const ml::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
++      const wnn::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
 +      TfLiteNode* node, const TfLiteTensor* tensors,
 +      const TfLiteResizeBilinearParams* resize_params,
-+      std::vector<ml::Operand>& webnn_operands) {
++      std::vector<wnn::Operand>& webnn_operands) {
 +    TF_LITE_ENSURE_STATUS(
 +        CheckNumInputsAndOutputs(logging_context, node, 2, 1, node_index));
 +
@@ -1883,29 +4906,17 @@ index 00000000000..754df504d28
 +    }
 +
 +    if (builder) {
-+      // Transpose NHWC to NCHW
-+      std::vector<int32_t> nhwc_to_nchw = {0, 3, 1, 2};
-+      ml::TransposeOptions transpose_options;
-+      transpose_options.permutation = nhwc_to_nchw.data();
-+      transpose_options.permutationCount = nhwc_to_nchw.size();
-+      TF_LITE_ENSURE(logging_context, webnn_operands[input_tensor_id]);
-+      ml::Operand input_operand = builder.Transpose(webnn_operands[input_tensor_id], &transpose_options);
-+      std::vector<int32_t> new_sizes = {
-+        input_tensor.dims->data[0],
-+        input_tensor.dims->data[3],
-+        shape_data[0],
-+        shape_data[1]
-+      };
-+      ml::ResampleOptions options;
-+      options.mode = ml::InterpolationMode::Linear;
-+      options.sizes = new_sizes.data();
-+      options.sizesCount = new_sizes.size();
-+      ml::Operand output = builder.Resample(input_operand, &options);
-+      // Transpose NCHW to NHWC
-+      std::vector<int32_t> nchw_to_nhwc = {0, 2, 3, 1};
-+      transpose_options.permutation = nchw_to_nhwc.data();
-+      transpose_options.permutationCount = nchw_to_nhwc.size();
-+      webnn_operands[output_tensor_id] = builder.Transpose(output, &transpose_options);
++      wnn::Operand input_operand = webnn_operands[input_tensor_id];
++      TF_LITE_ENSURE(logging_context, input_operand);
++      std::vector<int32_t> sizes = {shape_data[0], shape_data[1]};
++      std::vector<int32_t> axes = {1, 2};
++      wnn::Resample2dOptions options;
++      options.mode = wnn::InterpolationMode::Linear;
++      options.sizes = sizes.data();
++      options.sizesCount = sizes.size();
++      options.axes = axes.data();
++      options.axesCount = axes.size();
++      webnn_operands[output_tensor_id] = builder.Resample2d(input_operand, &options);
 +      TF_LITE_ENSURE(logging_context, webnn_operands[output_tensor_id]);
 +    }
 +
@@ -1913,10 +4924,10 @@ index 00000000000..754df504d28
 +  }
 +
 +  static TfLiteStatus VisitSoftmaxNode(
-+      const ml::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
++      const wnn::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
 +      TfLiteNode* node, const TfLiteTensor* tensors,
 +      const TfLiteSoftmaxParams* params,
-+      std::vector<ml::Operand>& webnn_operands) {
++      std::vector<wnn::Operand>& webnn_operands) {
 +    if (params->beta != 1.0f) {
 +      if (logging_context != nullptr) {
 +        TF_LITE_KERNEL_LOG(logging_context,
@@ -1952,24 +4963,227 @@ index 00000000000..754df504d28
 +    return kTfLiteOk;
 +  }
 +
-+ private:
-+  Subgraph(ml::Graph graph, std::unordered_set<int>&& inputs, std::unordered_set<int>&& outputs)
-+      : ml_graph_(graph), inputs_(inputs), outputs_(outputs) {
-+    for (auto& i : inputs_) {
-+      ml_inputs_[i] = {};
++  static TfLiteStatus VisitSplitNode(
++      const wnn::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
++      TfLiteNode* node, const TfLiteTensor* tensors,
++      const TfLiteSplitParams* params,
++      std::vector<wnn::Operand>& webnn_operands) {
++    const int num_splits = params->num_splits;
++    if (num_splits == 0) {
++      TF_LITE_MAYBE_KERNEL_LOG(
++          logging_context,
++          "unexpected value of num_splits %d in the split params in node %d",
++          num_splits, node_index);
++      return kTfLiteError;
 +    }
-+    for (auto& o : outputs_) {
-+      ml_outputs_[o] = {};
++
++    TF_LITE_ENSURE_STATUS(
++        CheckNumInputsAndOutputs(logging_context, node, 2, num_splits, node_index));
++
++    const int input_tensor_id = node->inputs->data[1];
++    const TfLiteTensor& input_tensor = tensors[input_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32OrQInt8Type(
++        logging_context, input_tensor, input_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, input_tensor, input_tensor_id, node_index));
++
++    const int axis_tensor_id = node->inputs->data[0];
++    const TfLiteTensor& axis_tensor = tensors[axis_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorType(logging_context, axis_tensor,
++                                          kTfLiteInt32, axis_tensor_id,
++                                          node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorShape(logging_context, axis_tensor, 0,
++                                           axis_tensor_id));
++    TF_LITE_ENSURE_STATUS(CheckTensorStaticAllocation(
++        logging_context, axis_tensor, axis_tensor_id, node_index));
++
++    const int* axis_data =
++        reinterpret_cast<const int*>(axis_tensor.data.data);
++    int axis_value = axis_data[0];
++
++    const int num_dims = input_tensor.dims->size;
++    if (axis_value < 0) {
++      axis_value += num_dims;
 +    }
++    if (axis_value < 0 || axis_value > num_dims) {
++      TF_LITE_MAYBE_KERNEL_LOG(
++          logging_context,
++          "unexpected data of axis %d in the axis tensor in node %d",
++          axis_data[0], node_index);
++      return kTfLiteError;
++    }
++    const int input_size = input_tensor.dims->data[axis_value];
++    if (input_size % num_splits != 0) {
++      TF_LITE_MAYBE_KERNEL_LOG(
++          logging_context,
++          "Not an even split");
++      return kTfLiteError;
++    }
++
++    const int output_size = node->outputs->size;
++
++    if (builder) {
++      std::vector<uint32_t> splits = {static_cast<const uint32_t>(num_splits)};
++      wnn::SplitOptions options;
++      options.axis = static_cast<const uint32_t>(axis_value);
++      TF_LITE_ENSURE(logging_context, webnn_operands[input_tensor_id]);
++      wnn::OperandArray split_operand_array = builder.Split(
++          webnn_operands[input_tensor_id], splits.data(), splits.size(), &options);
++      TF_LITE_ENSURE(logging_context, split_operand_array.Size() == output_size);
++
++      for (int i = 0; i < output_size; i++) {
++        int output_tensor_id = node->outputs->data[i];
++        const TfLiteTensor& output_tensor = tensors[output_tensor_id];
++        TF_LITE_ENSURE_STATUS(CheckTensorFloat32Type(
++            logging_context, output_tensor, output_tensor_id, node_index));
++        TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++            logging_context, output_tensor, output_tensor_id, node_index));
++        webnn_operands[output_tensor_id] = split_operand_array.Get(i);
++        TF_LITE_ENSURE(logging_context, webnn_operands[output_tensor_id]);
++      }
++    }
++
++    return kTfLiteOk;
 +  }
 +
-+  ml::Graph ml_graph_;
++  static TfLiteStatus VisitTanhNode(
++      const wnn::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
++      TfLiteNode* node, const TfLiteTensor* tensors,
++      std::vector<wnn::Operand>& webnn_operands) {
++    TF_LITE_ENSURE_STATUS(
++        CheckNumInputsAndOutputs(logging_context, node, 1, 1, node_index));
++
++    const TfLiteTensor& input_tensor = tensors[node->inputs->data[0]];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32Type(
++        logging_context, input_tensor, node->inputs->data[0], node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, input_tensor, node->inputs->data[0], node_index));
++
++    const TfLiteTensor& output_tensor = tensors[node->outputs->data[0]];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32Type(
++        logging_context, output_tensor, node->outputs->data[0], node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, output_tensor, node->outputs->data[0], node_index));
++
++    if (builder) {
++      TF_LITE_ENSURE(logging_context, webnn_operands[node->inputs->data[0]]);
++      webnn_operands[node->outputs->data[0]] = builder.Tanh(webnn_operands[node->inputs->data[0]]);
++      TF_LITE_ENSURE(logging_context, webnn_operands[node->outputs->data[0]]);
++    }
++
++    return kTfLiteOk;
++  }
++
++  static TfLiteStatus VisitUnpackNode(
++      const wnn::GraphBuilder& builder, TfLiteContext* logging_context, int node_index,
++      TfLiteNode* node, const TfLiteTensor* tensors,
++      const TfLiteUnpackParams* params,
++      std::vector<wnn::Operand>& webnn_operands) {
++    const int num = params->num;
++    int axis = params->axis;
++
++    TF_LITE_ENSURE_STATUS(
++        CheckNumInputsAndOutputs(logging_context, node, 1, num, node_index));
++
++    const int input_tensor_id = node->inputs->data[0];
++    const TfLiteTensor& input_tensor = tensors[input_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32OrQInt8Type(
++        logging_context, input_tensor, input_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, input_tensor, input_tensor_id, node_index));
++
++    const int num_dims = input_tensor.dims->size;
++    if (axis < 0) {
++      axis += num_dims;
++    }
++    if (axis < 0 || axis >= num_dims) {
++      TF_LITE_MAYBE_KERNEL_LOG(
++          logging_context,
++          "unexpected value of axis %d in the unpack params in node %d",
++          axis, node_index);
++      return kTfLiteError;
++    }
++
++    const int output_size = node->outputs->size;
++
++    if (num != output_size) {
++      TF_LITE_MAYBE_KERNEL_LOG(
++          logging_context,
++          "unexpected value of num %d in the unpack params in node %d",
++          num, node_index);
++      return kTfLiteError;
++    }
++
++    if (builder) {
++      TF_LITE_ENSURE(logging_context, webnn_operands[input_tensor_id]);
++      wnn::SqueezeOptions squeeze_options;
++      std::vector<int32_t> axes = {static_cast<int32_t>(axis)};
++      squeeze_options.axes = axes.data();
++      squeeze_options.axesCount = axes.size();
++      // Unpack = split + squeeze in WebNN
++      // No need split if Unpack's num == 1
++      if (num == 1) {
++        int output_tensor_id = node->outputs->data[0];
++        const TfLiteTensor& output_tensor = tensors[output_tensor_id];
++        TF_LITE_ENSURE_STATUS(CheckTensorFloat32Type(
++            logging_context, output_tensor, output_tensor_id, node_index));
++        TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++            logging_context, output_tensor, output_tensor_id, node_index));
++
++        webnn_operands[output_tensor_id] =
++            builder.Squeeze(webnn_operands[input_tensor_id], &squeeze_options);
++        TF_LITE_ENSURE(logging_context, webnn_operands[output_tensor_id]);
++      } else {
++        std::vector<uint32_t> splits = {static_cast<const uint32_t>(num)};
++        wnn::SplitOptions options;
++        options.axis = static_cast<const uint32_t>(axis);
++        wnn::OperandArray split_operand_array = builder.Split(
++            webnn_operands[input_tensor_id], splits.data(), splits.size(), &options);
++        TF_LITE_ENSURE(logging_context, split_operand_array.Size() == output_size);
++
++        for (int i = 0; i < output_size; i++) {
++          int output_tensor_id = node->outputs->data[i];
++          const TfLiteTensor& output_tensor = tensors[output_tensor_id];
++          TF_LITE_ENSURE_STATUS(CheckTensorFloat32Type(
++              logging_context, output_tensor, output_tensor_id, node_index));
++          TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++              logging_context, output_tensor, output_tensor_id, node_index));
++
++          webnn_operands[output_tensor_id] =
++              builder.Squeeze(split_operand_array.Get(i), &squeeze_options);
++          TF_LITE_ENSURE(logging_context, webnn_operands[output_tensor_id]);
++        }
++      }
++    }
++    return kTfLiteOk;
++  }
++
++ private:
++  Subgraph(wnn::Graph graph, std::unordered_set<int>&& inputs, std::unordered_set<int>&& outputs)
++      : wnn_graph_(graph), inputs_(inputs), outputs_(outputs) {
++    for (auto& i : inputs_) {
++      wnn_inputs_[i] = {};
++      externals_[i] = nullptr;
++    }
++    for (auto& o : outputs_) {
++      wnn_outputs_[o] = {};
++      externals_[o] = nullptr;
++    }
++    graph_inputs_ = wnn::CreateNamedInputs();
++    graph_outputs_ = wnn::CreateNamedOutputs();
++  }
++
++  wnn::Graph wnn_graph_;
 +  // TFLite Tensor IDs == name of input/output tensors for the
 +  // delegated subgraph.
 +  std::unordered_set<int> inputs_;
 +  std::unordered_set<int> outputs_;
-+  std::unordered_map<int, ml::Input> ml_inputs_;
-+  std::unordered_map<int, ml::ArrayBufferView> ml_outputs_;
++  std::unordered_map<int, wnn::Input> wnn_inputs_;
++  std::unordered_map<int, wnn::Resource> wnn_outputs_;
++  wnn::NamedInputs graph_inputs_;
++  wnn::NamedOutputs graph_outputs_;
++  std::unordered_map<int, void*> externals_;
++  char dummy_data_{0};
 +};
 +
 +TfLiteIntArray* Delegate::PrepareOpsToDelegate(TfLiteContext* context) {
@@ -2067,8 +5281,8 @@ index 00000000000..754df504d28
 +      }
 +    }
 +
-+    ml::GraphBuilder null_builder;
-+    std::vector<ml::Operand> empty_webnn_operands;
++    wnn::GraphBuilder null_builder;
++    std::vector<wnn::Operand> empty_webnn_operands;
 +    std::vector<std::unique_ptr<char>> empty_buffers;
 +    if (Subgraph::VisitNode(null_builder, context, registration, node,
 +                            node_index, quasi_static_tensors,
@@ -2230,7 +5444,7 @@ index 00000000000..754df504d28
 +          case kTfLiteFloat32: {
 +            const size_t dense_size = context->tensors[t].bytes / sizeof(float);
 +            float* unpacked_fp32_data = reinterpret_cast<float*>(unpacked_data);
-+            tflite::optimize::sparsity::FormatConverter<float> converter(
++            tflite::internal::sparsity::FormatConverter<float> converter(
 +                vector_shape, *input_tensor.sparsity);
 +            converter.SparseToDense(
 +                static_cast<const float*>(input_tensor.data.data), dense_size,
@@ -2242,7 +5456,7 @@ index 00000000000..754df504d28
 +                context->tensors[t].bytes / sizeof(Eigen::half);
 +            Eigen::half* unpacked_fp16_data =
 +                reinterpret_cast<Eigen::half*>(unpacked_data);
-+            tflite::optimize::sparsity::FormatConverter<Eigen::half> converter(
++            tflite::internal::sparsity::FormatConverter<Eigen::half> converter(
 +                vector_shape, *input_tensor.sparsity);
 +            converter.SparseToDense(
 +                static_cast<const Eigen::half*>(input_tensor.data.data),
@@ -2435,11 +5649,136 @@ index 00000000000..5b791c7777a
 +#endif  // __cplusplus
 +
 +#endif  // TENSORFLOW_LITE_DELEGATES_WEBNN_WEBNN_DELEGATE_H_
+diff --git a/tensorflow/lite/delegates/webnn/webnn_delegate_adaptor.cc b/tensorflow/lite/delegates/webnn/webnn_delegate_adaptor.cc
+new file mode 100644
+index 00000000000..32b6cba0e98
+--- /dev/null
++++ b/tensorflow/lite/delegates/webnn/webnn_delegate_adaptor.cc
+@@ -0,0 +1,83 @@
++/* Copyright 2021 The TensorFlow Authors. All Rights Reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++#include <string>
++#include <vector>
++
++#include "tensorflow/lite/tools/command_line_flags.h"
++#include "tensorflow/lite/tools/logging.h"
++#include "tensorflow/lite/delegates/webnn/webnn_delegate_adaptor.h"
++
++namespace tflite {
++namespace tools {
++
++TfLiteDelegate* CreateTfLiteWebNNDelegateFromOptions(char** options_keys,
++                                                     char** options_values,
++                                                     size_t num_options) {
++  TfLiteWebNNDelegateOptions options = TfLiteWebNNDelegateOptionsDefault();
++  // Parse key-values options to TfLiteWebNNDelegateOptions by mimicking them as
++  // command-line flags.
++  std::vector<const char*> argv;
++  argv.reserve(num_options + 1);
++  constexpr char kWebNNDelegateParsing[] = "webnn_delegate_parsing";
++  argv.push_back(kWebNNDelegateParsing);
++
++  std::vector<std::string> option_args;
++  option_args.reserve(num_options);
++  for (int i = 0; i < num_options; ++i) {
++    option_args.emplace_back("--");
++    option_args.rbegin()->append(options_keys[i]);
++    option_args.rbegin()->push_back('=');
++    option_args.rbegin()->append(options_values[i]);
++    argv.push_back(option_args.rbegin()->c_str());
++  }
++
++  constexpr char kWebNNDevicePreference[] = "webnn_device";
++
++  std::vector<tflite::Flag> flag_list = {
++      tflite::Flag::CreateFlag(kWebNNDevicePreference,
++                               reinterpret_cast<int32_t*>(&options.devicePreference),
++                               "WebNN device (0:default, 1:gpu, 2:cpu)."),
++  };
++
++  int argc = num_options + 1;
++  if (!tflite::Flags::Parse(&argc, argv.data(), flag_list)) {
++    return nullptr;
++  }
++
++  TFLITE_LOG(INFO) << "WebNN delegate: WebNN device set to "
++                   << options.devicePreference << ".";
++
++  return TfLiteWebNNDelegateCreate(&options);
++}
++
++}  // namespace tools
++}  // namespace tflite
++
++extern "C" {
++
++// Defines two symbols that need to be exported to use the TFLite external
++// delegate. See tensorflow/lite/delegates/external for details.
++TfLiteDelegate* tflite_plugin_create_delegate(
++    char** options_keys, char** options_values, size_t num_options,
++    void (*report_error)(const char*)) {
++  return tflite::tools::CreateTfLiteWebNNDelegateFromOptions(
++      options_keys, options_values, num_options);
++}
++
++void tflite_plugin_destroy_delegate(TfLiteDelegate* delegate) {
++  TfLiteWebNNDelegateDelete(delegate);
++}
++
++}  // extern "C"
+diff --git a/tensorflow/lite/delegates/webnn/webnn_delegate_adaptor.h b/tensorflow/lite/delegates/webnn/webnn_delegate_adaptor.h
+new file mode 100644
+index 00000000000..5f2c66fd5b1
+--- /dev/null
++++ b/tensorflow/lite/delegates/webnn/webnn_delegate_adaptor.h
+@@ -0,0 +1,30 @@
++/* Copyright 2021 The TensorFlow Authors. All Rights Reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#include "tensorflow/lite/c/common.h"
++#include "tensorflow/lite/delegates/webnn/webnn_delegate.h"
++#include "tensorflow/lite/c/c_api_types.h"  // IWYU pragma: export
++
++extern "C" {
++
++// Defines two symbols that need to be exported to use the TFLite external
++// delegate. See tensorflow/lite/delegates/external for details.
++TFL_CAPI_EXPORT TfLiteDelegate* tflite_plugin_create_delegate(
++    char** options_keys, char** options_values, size_t num_options,
++    void (*report_error)(const char*));
++
++TFL_CAPI_EXPORT void tflite_plugin_destroy_delegate(TfLiteDelegate* delegate);
++
++}  // extern "C"
 diff --git a/tensorflow/lite/examples/label_image/CMakeLists.txt b/tensorflow/lite/examples/label_image/CMakeLists.txt
-index 188906e791f..d4388ea434d 100644
+index 1bf259aad10..9301e54824e 100644
 --- a/tensorflow/lite/examples/label_image/CMakeLists.txt
 +++ b/tensorflow/lite/examples/label_image/CMakeLists.txt
-@@ -40,6 +40,18 @@ else()
+@@ -41,6 +41,18 @@ else()
    set(TFLITE_LABEL_IMAGE_CC_OPTIONS "-DTFLITE_WITHOUT_XNNPACK")
  endif()  # TFLITE_ENABLE_XNNPACK
  
@@ -2447,7 +5786,7 @@ index 188906e791f..d4388ea434d 100644
 +  list(APPEND TFLITE_LABEL_IMAGE_SRCS
 +    ${TFLITE_SOURCE_DIR}/tools/delegates/webnn_delegate_provider.cc
 +  )
-+  list(APPEND TFLITE_LABEL_IMAGE_SRCS "$ENV{WEBNN_NATIVE_DIR}/gen/src/webnn/webnn_cpp.cpp")
++  list(APPEND TFLITE_LABEL_IMAGE_SRCS "$ENV{WEBNN_NATIVE_DIR}/out/Release/gen/src/webnn/webnn_cpp.cpp")
 +  link_directories(
 +    "$ENV{WEBNN_NATIVE_DIR}"
 +  )
@@ -2458,23 +5797,23 @@ index 188906e791f..d4388ea434d 100644
  if(CMAKE_SYSTEM_NAME MATCHES "Android")
    if(_TFLITE_ENABLE_NNAPI)
      list(APPEND TFLITE_LABEL_IMAGE_SRCS
-@@ -65,3 +77,10 @@ target_compile_options(label_image
+@@ -66,3 +78,10 @@ target_compile_options(label_image
  target_link_libraries(label_image
    tensorflow-lite
  )
 +
 +if(TFLITE_ENABLE_WEBNN)
 +  target_link_libraries(label_image
-+    webnn_native
-+    webnn_proc
++    $ENV{WEBNN_NATIVE_DIR}/out/Release/libwebnn_native.so
++    $ENV{WEBNN_NATIVE_DIR}/out/Release/libwebnn_proc.so
 +  )
 +endif()
 \ No newline at end of file
 diff --git a/tensorflow/lite/examples/label_image/label_image.cc b/tensorflow/lite/examples/label_image/label_image.cc
-index 15583426fe5..963d9d874f5 100644
+index b3943380761..61f839fa3b8 100644
 --- a/tensorflow/lite/examples/label_image/label_image.cc
 +++ b/tensorflow/lite/examples/label_image/label_image.cc
-@@ -136,6 +136,17 @@ class DelegateProviders {
+@@ -129,6 +129,17 @@ class DelegateProviders {
          params_.Set<bool>("num_threads", s.number_of_threads);
        }
      }
@@ -2492,7 +5831,7 @@ index 15583426fe5..963d9d874f5 100644
    }
  
    // Create a list of TfLite delegates based on what have been initialized (i.e.
-@@ -223,6 +234,9 @@ void RunInference(Settings* settings,
+@@ -216,6 +227,9 @@ void RunInference(Settings* settings,
  
    tflite::ops::builtin::BuiltinOpResolver resolver;
  
@@ -2502,21 +5841,19 @@ index 15583426fe5..963d9d874f5 100644
    tflite::InterpreterBuilder(*model, resolver)(&interpreter);
    if (!interpreter) {
      LOG(ERROR) << "Failed to construct interpreter";
-@@ -422,7 +436,9 @@ void display_usage() {
-       << "--threads, -t: number of threads\n"
-       << "--verbose, -v: [0|1] print more information\n"
-       << "--warmup_runs, -w: number of warmup runs\n"
--      << "--xnnpack_delegate, -x [0:1]: xnnpack delegate\n";
-+      << "--xnnpack_delegate, -x [0:1]: xnnpack delegate\n"
-+      << "--webnn_delegate, -n [0|1]: webnn delegate (on|off)\n"
-+      << "--webnn_device, -d [0|1|2]: webnn device (default|gpu|cpu) \n";
+@@ -420,6 +434,8 @@ void display_usage(const DelegateProviders& delegate_providers) {
+       << "\t--verbose, -v: [0|1] print more information\n"
+       << "\t--warmup_runs, -w: number of warmup runs\n"
+       << "\t--xnnpack_delegate, -x [0:1]: xnnpack delegate\n"
++      << "\t--webnn_delegate, -n [0|1]: webnn delegate (on|off)\n"
++      << "\t--webnn_device, -d [0|1|2]: webnn device (default|gpu|cpu) \n";
+       << "\t--help, -h: Print this help message\n";
  }
  
- int Main(int argc, char** argv) {
-@@ -455,13 +471,15 @@ int Main(int argc, char** argv) {
-         {"gl_backend", required_argument, nullptr, 'g'},
+@@ -455,12 +471,14 @@ int Main(int argc, char** argv) {
          {"hexagon_delegate", required_argument, nullptr, 'j'},
          {"xnnpack_delegate", required_argument, nullptr, 'x'},
+         {"help", no_argument, nullptr, 'h'},
 +        {"webnn_delegate", required_argument, nullptr, 'n'},
 +        {"webnn_device", required_argument, nullptr, 'd'},
          {nullptr, 0, nullptr, 0}};
@@ -2524,13 +5861,12 @@ index 15583426fe5..963d9d874f5 100644
      /* getopt_long stores the option index here. */
      int option_index = 0;
  
-     c = getopt_long(argc, argv,
--                    "a:b:c:d:e:f:g:i:j:l:m:p:r:s:t:v:w:x:", long_options,
-+                    "a:b:c:d:e:f:g:i:j:l:m:p:r:s:t:v:w:x:n:", long_options,
-                     &option_index);
+-    c = getopt_long(argc, argv, "a:b:c:d:e:f:g:i:j:l:m:p:r:s:t:v:w:x:h",
++    c = getopt_long(argc, argv, "a:b:c:d:e:f:g:i:j:l:m:p:r:s:t:v:w:x:n:d:h",
+                     long_options, &option_index);
  
      /* Detect the end of the options. */
-@@ -529,6 +547,14 @@ int Main(int argc, char** argv) {
+@@ -528,6 +546,14 @@ int Main(int argc, char** argv) {
          s.xnnpack_delegate =
              strtol(optarg, nullptr, 10);  // NOLINT(runtime/deprecated_fn)
          break;
@@ -2558,6 +5894,23 @@ index 1c00edb6558..e84ed493b62 100644
    int loop_count = 1;
    float input_mean = 127.5f;
    float input_std = 127.5f;
+diff --git a/tensorflow/lite/simple_memory_arena.cc b/tensorflow/lite/simple_memory_arena.cc
+index 1c7a03846f5..c698e734ee8 100644
+--- a/tensorflow/lite/simple_memory_arena.cc
++++ b/tensorflow/lite/simple_memory_arena.cc
+@@ -169,10 +169,9 @@ TfLiteStatus SimpleMemoryArena::ReleaseBuffer() {
+ }
+ 
+ // Using weak symbols to create a pluggable debugging module.
+-TFLITE_ATTRIBUTE_WEAK void DumpArenaInfo(
++extern void DumpArenaInfo(
+     const std::string& name, const std::vector<int>& execution_plan,
+-    size_t arena_size, const std::vector<ArenaAllocWithUsageInterval>& allocs) {
+-}
++    size_t arena_size, const std::vector<ArenaAllocWithUsageInterval>& allocs);
+ 
+ void SimpleMemoryArena::DumpDebugInfo(
+     const std::string& name, const std::vector<int>& execution_plan) const {
 diff --git a/tensorflow/lite/tflite_with_webnn.cc b/tensorflow/lite/tflite_with_webnn.cc
 new file mode 100644
 index 00000000000..e22a8557e68
@@ -2592,29 +5945,30 @@ index 00000000000..e22a8557e68
 +}
 +}  // namespace tflite
 diff --git a/tensorflow/lite/tools/benchmark/CMakeLists.txt b/tensorflow/lite/tools/benchmark/CMakeLists.txt
-index 015f8f21f02..ef88d63ce2d 100644
+index ae24d998ced..1f1aa4f4051 100644
 --- a/tensorflow/lite/tools/benchmark/CMakeLists.txt
 +++ b/tensorflow/lite/tools/benchmark/CMakeLists.txt
-@@ -52,6 +52,18 @@ else()
-   set(TFLITE_BENCHMARK_CC_OPTIONS "-DTFLITE_WITHOUT_XNNPACK")
- endif()  # TFLITE_ENABLE_XNNPACK
+@@ -61,6 +61,19 @@ if(TFLITE_ENABLE_EXTERNAL_DELEGATE)
+   )
+ endif()  # TFLITE_ENABLE_EXTERNAL_DELEGATE
  
 +if(TFLITE_ENABLE_WEBNN)
 +  list(APPEND TFLITE_BENCHMARK_SRCS
 +    ${TFLITE_SOURCE_DIR}/tools/delegates/webnn_delegate_provider.cc
 +  )
-+  list(APPEND TFLITE_BENCHMARK_SRCS "$ENV{WEBNN_NATIVE_DIR}/gen/src/webnn/webnn_cpp.cpp")
++  list(APPEND TFLITE_BENCHMARK_SRCS "$ENV{WEBNN_NATIVE_DIR}/out/Release/gen/src/webnn/webnn_cpp.cpp")
 +  link_directories(
 +    "$ENV{WEBNN_NATIVE_DIR}"
 +  )
 +else()
++  set(TFLITE_BENCHMARK_CC_OPTIONS "-DTFLITE_WITHOUT_WEBNN")
 +  set(TFLITE_LABEL_IMAGE_CC_OPTIONS "-DTFLITE_WITHOUT_WEBNN")
 +endif()  # TFLITE_ENABLE_WEBNN
 +
  if(CMAKE_SYSTEM_NAME MATCHES "Android")
    if(_TFLITE_ENABLE_NNAPI)
      list(APPEND TFLITE_BENCHMARK_SRCS
-@@ -81,3 +93,17 @@ target_compile_options(benchmark_model
+@@ -90,3 +103,17 @@ target_compile_options(benchmark_model
  target_link_libraries(benchmark_model
      ${TFLITE_BENCHMARK_LIBS}
  )
@@ -2622,21 +5976,21 @@ index 015f8f21f02..ef88d63ce2d 100644
 +if(TFLITE_ENABLE_WEBNN)
 +  if(CMAKE_SYSTEM_NAME MATCHES "Windows")
 +    target_link_libraries(benchmark_model
-+      $ENV{WEBNN_NATIVE_DIR}/webnn_native.dll.lib
-+      $ENV{WEBNN_NATIVE_DIR}/webnn_proc.dll.lib
++      $ENV{WEBNN_NATIVE_DIR}/out/Release/webnn_native.dll.lib
++      $ENV{WEBNN_NATIVE_DIR}/out/Release/webnn_proc.dll.lib
 +    )
 +  else()
 +    target_link_libraries(benchmark_model
-+      webnn_native
-+      webnn_proc
++      $ENV{WEBNN_NATIVE_DIR}/out/Release/libwebnn_native.so
++      $ENV{WEBNN_NATIVE_DIR}/out/Release/libwebnn_proc.so
 +    )
 +  endif()
 +endif()
 diff --git a/tensorflow/lite/tools/benchmark/benchmark_tflite_model.cc b/tensorflow/lite/tools/benchmark/benchmark_tflite_model.cc
-index 4b475d78553..5b25ee2adb4 100644
+index c1cb6ba58ea..5b87b6ab616 100644
 --- a/tensorflow/lite/tools/benchmark/benchmark_tflite_model.cc
 +++ b/tensorflow/lite/tools/benchmark/benchmark_tflite_model.cc
-@@ -811,6 +811,9 @@ std::unique_ptr<tflite::OpResolver> BenchmarkTfLiteModel::GetOpResolver()
+@@ -777,6 +777,9 @@ std::unique_ptr<tflite::OpResolver> BenchmarkTfLiteModel::GetOpResolver()
    } else {
      resolver = new tflite::ops::builtin::BuiltinOpResolver();
    }
@@ -2646,12 +6000,34 @@ index 4b475d78553..5b25ee2adb4 100644
    RegisterSelectedOps(resolver);
    return std::unique_ptr<tflite::OpResolver>(resolver);
  }
+diff --git a/tensorflow/lite/tools/delegates/BUILD b/tensorflow/lite/tools/delegates/BUILD
+index 609b6630bd3..7775df76240 100644
+--- a/tensorflow/lite/tools/delegates/BUILD
++++ b/tensorflow/lite/tools/delegates/BUILD
+@@ -45,7 +45,7 @@ cc_library(
+         ":external_delegate_provider",
+         ":gpu_delegate_provider",
+         ":hexagon_delegate_provider",
+-        ":nnapi_delegate_provider",
++        # ":nnapi_delegate_provider",
+         ":xnnpack_delegate_provider",
+     ],
+     alwayslink = 1,
+@@ -197,7 +197,7 @@ cc_test(
+         ":default_execution_provider",
+         ":delegate_provider_hdr",
+         ":delegate_provider_lib",
+-        ":nnapi_delegate_provider",
++        # ":nnapi_delegate_provider",
+         ":xnnpack_delegate_provider",
+         "//tensorflow/lite/delegates/utils/dummy_delegate:dummy_delegate_provider",
+         "//tensorflow/lite/tools:tool_params",
 diff --git a/tensorflow/lite/tools/delegates/webnn_delegate_provider.cc b/tensorflow/lite/tools/delegates/webnn_delegate_provider.cc
 new file mode 100644
-index 00000000000..da38b1f3a62
+index 00000000000..9cb253eb214
 --- /dev/null
 +++ b/tensorflow/lite/tools/delegates/webnn_delegate_provider.cc
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,73 @@
 +/* Copyright 2021 The TensorFlow Authors. All Rights Reserved.
 +
 +Licensed under the Apache License, Version 2.0 (the "License");
@@ -2686,6 +6062,8 @@ index 00000000000..da38b1f3a62
 +  void LogParams(const ToolParams& params, bool verbose) const final;
 +
 +  TfLiteDelegatePtr CreateTfLiteDelegate(const ToolParams& params) const final;
++  std::pair<TfLiteDelegatePtr, int> CreateRankedTfLiteDelegate(
++      const ToolParams& params) const final;
 +
 +  std::string GetName() const final { return "WebNN"; }
 +};
@@ -2710,23 +6088,48 @@ index 00000000000..da38b1f3a62
 +  if (params.Get<bool>("use_webnn")) {
 +    return evaluation::CreateWebNNDelegate(params.Get<int>("webnn_device"));
 +  }
-+  return TfLiteDelegatePtr(nullptr, [](TfLiteDelegate*) {});
++  return CreateNullDelegate();
++}
++
++std::pair<TfLiteDelegatePtr, int>
++WebNNDelegateProvider::CreateRankedTfLiteDelegate(
++    const ToolParams& params) const {
++  auto ptr = CreateTfLiteDelegate(params);
++  return std::make_pair(std::move(ptr),
++                        params.GetPosition<bool>("use_webnn"));
 +}
 +
 +}  // namespace tools
 +}  // namespace tflite
+diff --git a/tensorflow/lite/tools/evaluation/BUILD b/tensorflow/lite/tools/evaluation/BUILD
+index 02ca40fad25..583d8d65972 100644
+--- a/tensorflow/lite/tools/evaluation/BUILD
++++ b/tensorflow/lite/tools/evaluation/BUILD
+@@ -59,6 +59,12 @@ cc_library(
+         "//conditions:default": [
+             "//tensorflow/lite/delegates/xnnpack:xnnpack_delegate",
+         ],
++    }) + select({
++        "//tensorflow:linux_armhf": [],
++        "//tensorflow:linux_s390x": [],
++        "//conditions:default": [
++            "//tensorflow/lite/delegates/webnn:webnn_delegate",
++        ],
+     }),
+ )
+ 
 diff --git a/tensorflow/lite/tools/evaluation/utils.cc b/tensorflow/lite/tools/evaluation/utils.cc
-index ec09394eb02..bfd0f66c094 100644
+index 7be427792f1..2bac90efa6a 100644
 --- a/tensorflow/lite/tools/evaluation/utils.cc
 +++ b/tensorflow/lite/tools/evaluation/utils.cc
-@@ -194,5 +194,19 @@ TfLiteDelegatePtr CreateXNNPACKDelegate(int num_threads) {
+@@ -188,5 +188,19 @@ TfLiteDelegatePtr CreateXNNPACKDelegate(int num_threads) {
    return CreateXNNPACKDelegate(&opts);
  }
  #endif
 +
 +TfLiteDelegatePtr CreateWebNNDelegate(int device) {
 +#if defined(TFLITE_WITHOUT_WEBNN)
-+  return CreateNullDelegate();
++  return tools::CreateNullDelegate();
 +#else
 +  TfLiteWebNNDelegateOptions options =
 +      TfLiteWebNNDelegateOptionsDefault();
@@ -2740,7 +6143,7 @@ index ec09394eb02..bfd0f66c094 100644
  }  // namespace evaluation
  }  // namespace tflite
 diff --git a/tensorflow/lite/tools/evaluation/utils.h b/tensorflow/lite/tools/evaluation/utils.h
-index 4a25502b5e6..f87720d946f 100644
+index 18590efc54d..135fa4b4377 100644
 --- a/tensorflow/lite/tools/evaluation/utils.h
 +++ b/tensorflow/lite/tools/evaluation/utils.h
 @@ -39,6 +39,10 @@ limitations under the License.
@@ -2764,3 +6167,66 @@ index 4a25502b5e6..f87720d946f 100644
  }  // namespace evaluation
  }  // namespace tflite
  
+diff --git a/third_party/webnn/BUILD b/third_party/webnn/BUILD
+new file mode 100644
+index 00000000000..90ca20d373f
+--- /dev/null
++++ b/third_party/webnn/BUILD
+@@ -0,0 +1 @@
++# This empty BUILD file is required to make Bazel treat this directory as a package.
+\ No newline at end of file
+diff --git a/third_party/webnn/webnn.bzl b/third_party/webnn/webnn.bzl
+new file mode 100644
+index 00000000000..4ee8cc9a4f2
+--- /dev/null
++++ b/third_party/webnn/webnn.bzl
+@@ -0,0 +1,48 @@
++def _get_webnn_native_dir(repository_ctx):
++    """Gets the Webnn-native path"""
++    webnn_native_dir = repository_ctx.os.environ.get("WEBNN_NATIVE_DIR")
++    if webnn_native_dir != None:
++        return webnn_native_dir
++    else:
++        fail("Cannot find Webnn-native dir, please set 'WEBNN_NATIVE_DIR' environment variable.")
++
++def _webnn_native_impl(repository_ctx):
++    webnn_native_dir = _get_webnn_native_dir(repository_ctx)
++    repository_ctx.symlink(webnn_native_dir, "webnn-native")
++    repository_ctx.file("BUILD", """
++cc_library(
++    name = "webnn-native",
++    hdrs = glob([
++        "webnn-native/out/Release/gen/src/include/**/*.h",
++        "webnn-native/src/include/*/*.h"
++    ]),
++    srcs = select({
++        "@bazel_tools//src/conditions:windows": glob([
++            "webnn-native/out/Release/webnn_native.dll",
++            "webnn-native/out/Release/webnn_native.dll.lib",
++            "webnn-native/out/Release/webnn_proc.dll",
++            "webnn-native/out/Release/webnn_proc.dll.lib",
++            "webnn-native/out/Release/gen/src/webnn/webnn_cpp.cpp"
++        ]),
++        "//conditions:default":glob([
++            "webnn-native/out/Release/libngraph_c_api.so",
++            "webnn-native/out/Release/libwebnn_native.so",
++            "webnn-native/out/Release/libwebnn_proc.so",
++            "webnn-native/out/Release/gen/src/webnn/webnn_cpp.cpp"
++        ]),
++    }),
++    includes = [
++        "webnn-native/out/Release/gen/src/include",
++        "webnn-native/src/include"
++    ],
++    visibility = ["//visibility:public"],
++)
++    """)
++
++webnn_configure = repository_rule(
++    implementation = _webnn_native_impl,
++    local = True,
++    environ = [
++        "WEBNN_NATIVE_DIR",
++    ],
++)
+\ No newline at end of file

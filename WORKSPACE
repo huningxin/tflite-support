@@ -577,12 +577,12 @@ http_archive(
 
 emscripten_url = "https://storage.googleapis.com/webassembly/emscripten-releases-builds/{}/{}/wasm-binaries.tbz2"
 
-# "2.0.15"
+# "3.1.4"
 http_archive(
     name = "emscripten_bin_linux",
     strip_prefix = "install",
-    url = emscripten_url.format("linux", "89202930a98fe7f9ed59b574469a9471b0bda7dd"),
-    sha256 = "7ff49fc63adf29970f6e7af1df445d7f554bdbbb2606db1cb5d3567ce69df1db",
+    url = emscripten_url.format("linux", "39e60dda6945cfcd6487725bdb1361ae7975173f"),
+    sha256 = "4a57c0d60eeb4e021de61c8497f0b595a0a9db0235f1640a528de752409f4fcf",
     build_file = "@emsdk//emscripten_toolchain:emscripten.BUILD",
     type = "tar.bz2",
     patches = [
