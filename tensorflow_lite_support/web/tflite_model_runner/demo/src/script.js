@@ -1,26 +1,39 @@
-MODEL_PATH = 'mobilenetv2.tflite';
-
 async function start() {
   //////////////////////////////////////////////////////////////////////////////
   // Create the model runner with the model.
 
+  let modelPath = document.getElementById('model').value + '.tflite';
   const startTs = Date.now();
 
   // Load WASM module and model.
   const [module, modelArrayBuffer] = await Promise.all([
     tflite_model_runner_ModuleFactory(),
-    (await fetch(MODEL_PATH)).arrayBuffer(),
+    (await fetch(modelPath)).arrayBuffer(),
   ]);
   const modelBytes = new Uint8Array(modelArrayBuffer);
   const offset = module._malloc(modelBytes.length);
   module.HEAPU8.set(modelBytes, offset);
+
+  // Set webnn-polyfill backend if needed
+  if (navigator.ml.createContext().tf !== undefined) {
+    const tf = navigator.ml.createContext().tf;
+    const devicePreference = parseInt(document.getElementById('webnnDevice').value);
+    if (devicePreference === 1) {
+      tf.setBackend('webgl');
+    } else {
+      tf.setBackend('wasm');
+    }
+    await tf.ready();
+  }
 
   // Create model runner.
   const modelRunnerResult =
       module.TFLiteWebModelRunner.CreateFromBufferAndOptions(
           offset, modelBytes.length, {
             numThreads: Math.min(
-                4, Math.max(1, (navigator.hardwareConcurrency || 1) / 2))
+                4, Math.max(1, (navigator.hardwareConcurrency || 1) / 2)),
+            enableWebNNDelegate: document.getElementById('webnnDelegate').checked,
+            webNNDevicePreference: parseInt(document.getElementById('webnnDevice').value)
           });
   if (!modelRunnerResult.ok()) {
     throw new Error(
@@ -29,11 +42,9 @@ async function start() {
   const modelRunner = modelRunnerResult.value();
   const loadFinishedMs = Date.now() - startTs;
   document.querySelector('.loading-stats').textContent =
-      `Loaded WASM module and TFLite model ${MODEL_PATH} in ${
+      `Loaded WASM module and TFLite model ${modelPath} in ${
           loadFinishedMs}ms`;
   document.querySelector('.content').classList.remove('hide');
-
-
 
   //////////////////////////////////////////////////////////////////////////////
   // Get input and output info.
@@ -72,10 +83,28 @@ async function start() {
   //////////////////////////////////////////////////////////////////////////////
   // Infer, get output tensor, and sort by logit values in reverse.
 
-  const inferStart = Date.now();
-  const success = modelRunner.Infer();
-  const inferLatency = Date.now() - inferStart;
-  if (!success) return;
+  // Set 'numRuns' param to run inference multiple times
+  // numRuns includes the first run of inference
+  
+  let numRuns = document.getElementById('numRuns').value;
+  console.log('numRuns: ', numRuns);
+
+  if (numRuns < 1) {
+    alert('Run Number should be greater than 0!');
+    return;
+  }
+  numRuns = numRuns === null ? 1 : parseInt(numRuns);
+
+  const inferTimes = [];
+  for (let i = 0; i < numRuns; i++) {
+    const start = performance.now();
+    const success = modelRunner.Infer();
+    const inferTime = (performance.now() - start).toFixed(2);
+    if (!success) return;
+    console.log(`Infer time ${i+1}: ${inferTime} ms`);
+    inferTimes.push(Number(inferTime));
+  }
+
   const result = Array.from(output.data());
   result.shift();  // Remove the first logit which is the background noise.
   const sortedResult = result
@@ -89,16 +118,32 @@ async function start() {
 
   const classIndex = sortedResult[0].i;
   const score = sortedResult[0].logit;
-  document.querySelector('.result').textContent =
-      `${IMAGENET_CLASSES[classIndex]} (score: ${score.toFixed(3)}, latency: ${
-          inferLatency}ms)`;
+  if (inferTimes.length > 1) {
+    const averageTime = (inferTimes.reduce((acc, curr) => acc + curr, 0) / inferTimes.length).toFixed(2);
+    const minTime = Math.min(...inferTimes);
+    const maxTime = Math.max(...inferTimes);
+    const medianTime = getMedianValue(inferTimes);
+    document.querySelector('.result').innerHTML =
+    `${IMAGENET_CLASSES[classIndex]} (score: ${score.toFixed(3)}) <br>
+      numRuns: ${numRuns} <br> average time: ${averageTime} ms <br>
+      median time: ${medianTime} ms <br> max Time: ${maxTime} ms <br>
+      min Time: ${minTime} ms`;
+  } else {
+    document.querySelector('.result').textContent =
+    `${IMAGENET_CLASSES[classIndex]} (score: ${score.toFixed(3)}, latency: ${
+      inferTimes[0]}ms)`;
+  }
 }
-
-start();
-
 
 ////////////////////////////////////////////////////////////////////////////////
 // Helper functions.
+
+function getMedianValue(array) {
+  array = array.sort((a, b) => a - b);
+  const medianValue = array.length % 2 !== 0 ? array[Math.floor(array.length / 2)] :
+      (array[array.length / 2 - 1] + array[array.length / 2]) / 2;
+  return medianValue.toFixed(2);
+}
 
 let fromPixels2DContext;
 

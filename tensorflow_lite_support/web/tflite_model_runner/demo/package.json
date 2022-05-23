@@ -1,9 +1,20 @@
 {
+  "name": "tflite-web-api-model-runner-demo",
+  "version": "0.1.0",
+  "private": true,
   "devDependencies": {
-    "clang-format": "~1.2.4"
+    "clang-format": "~1.2.4",
+    "electron": "^15.0.0",
+    "electron-packager": "^15.4.0"
   },
+  "dependencies": {
+    "webnn-node": "file:deps/webnn-native/node"
+  },
+  "main": "main.js",
   "scripts": {
     "build": "./build.sh",
-    "start": "./start.sh"
+    "start": "./start.sh",
+    "electron": "./electron.sh",
+    "electron-packager": "electron-packager . tflite-web-api-model-runner-demo --linux --ignore=\"/(deps|src)\"; cp demo-launcher ./tflite-web-api-model-runner-demo-linux-x64"
   }
 }

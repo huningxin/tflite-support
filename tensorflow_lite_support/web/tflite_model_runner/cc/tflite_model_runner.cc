@@ -24,6 +24,8 @@ limitations under the License.
 #include "tensorflow/lite/kernels/internal/tensor_ctypes.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 #include "tensorflow_lite_support/cc/port/statusor.h"
+#include "tensorflow/lite/interpreter.h"
+#include "tensorflow/lite/delegates/webnn/webnn_delegate.h"
 
 using tflite::support::StatusOr;
 
@@ -85,6 +87,9 @@ TfLiteStatus TFLiteWebModelRunner::InitFromBuffer(
   model_ =
       tflite::FlatBufferModel::BuildFromBuffer(model_buffer, model_buffer_size);
 
+  static TfLiteRegistration reg = {nullptr, nullptr, nullptr, nullptr};
+  reinterpret_cast<tflite::ops::builtin::BuiltinOpResolver*>(resolver.get())->AddCustom("Convolution2DTransposeBias", &reg);
+
   // Initialize the interpreter from the model.
   const auto interpreter_builder_result =
       tflite::InterpreterBuilder(model_->GetModel(), *resolver, nullptr)(
@@ -94,6 +99,19 @@ TfLiteStatus TFLiteWebModelRunner::InitFromBuffer(
   }
   if (!model_->initialized()) {
     return kTfLiteError;
+  }
+
+  if (options_.enable_webnn_delegate) {
+    TfLiteWebNNDelegateOptions options =
+        TfLiteWebNNDelegateOptionsDefault();
+    options.devicePreference = options_.webnn_device_preference;
+    auto webnn_delegate = TfLiteWebNNDelegateCreate(&options);
+    auto delegate_ptr = tflite::Interpreter::TfLiteDelegatePtr(webnn_delegate, [](TfLiteDelegate* delegate) {
+      TfLiteWebNNDelegateDelete(delegate);
+    });
+    if (interpreter_->ModifyGraphWithDelegate(std::move(delegate_ptr)) != kTfLiteOk) {
+        printf("Failed to apply webnn delegate.\n");
+    }
   }
 
   // Allocate memory for the tensors in the model.
