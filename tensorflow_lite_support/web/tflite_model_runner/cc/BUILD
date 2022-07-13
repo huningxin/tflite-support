@@ -26,13 +26,10 @@ cc_binary(
     name = "tflite_model_runner_cc_threaded_simd",
     srcs = ["tflite_model_runner_wasm.cc"],
     copts = [
-        "-fno-rtti",
-        "-DEMSCRIPTEN_HAS_UNBOUND_TYPE_NAMES=0",
     ],
     linkopts = [
         "--bind",
         "-Os",
-        "-fno-rtti",
         "-s ASSERTIONS=0",
         "-s ALLOW_MEMORY_GROWTH=1",
         "-s EXIT_RUNTIME=0",
@@ -50,7 +47,6 @@ cc_binary(
         "-s ERROR_ON_UNDEFINED_SYMBOLS=0",
         "-s MALLOC=emmalloc",
         "-s INLINING_LIMIT=1",
-        "-s USE_WEBNN=1",
     ],
     linkstatic = 1,
     deps = [
@@ -75,14 +71,11 @@ cc_binary(
     name = "tflite_model_runner_cc_simd",
     srcs = ["tflite_model_runner_wasm.cc"],
     copts = [
-        "-fno-rtti",
-        "-DEMSCRIPTEN_HAS_UNBOUND_TYPE_NAMES=0",
     ],
     linkopts = [
         "--bind",
         "-Os",
-        "-fno-rtti",
-        "-s ASSERTIONS=0",
+        "-s ASSERTIONS=1",
         "-s ALLOW_MEMORY_GROWTH=1",
         "-s EXIT_RUNTIME=0",
         "-s MODULARIZE=1",
@@ -95,7 +88,9 @@ cc_binary(
         "-s ERROR_ON_UNDEFINED_SYMBOLS=0",
         "-s MALLOC=emmalloc",
         "-s INLINING_LIMIT=1",
-        "-s USE_WEBNN=1",
+        "-gsource-map", # enables source maps and also let you view the original source in browser debuggers.
+        "-Wall",
+        "-Werror",
     ],
     linkstatic = 1,
     deps = [
@@ -120,13 +115,10 @@ cc_binary(
     name = "tflite_model_runner_cc",
     srcs = ["tflite_model_runner_wasm.cc"],
     copts = [
-        "-fno-rtti",
-        "-DEMSCRIPTEN_HAS_UNBOUND_TYPE_NAMES=0",
     ],
     linkopts = [
         "--bind",
         "-Os",
-        "-fno-rtti",
         "-s ASSERTIONS=0",
         "-s ALLOW_MEMORY_GROWTH=1",
         "-s EXIT_RUNTIME=0",
@@ -140,7 +132,6 @@ cc_binary(
         "-s ERROR_ON_UNDEFINED_SYMBOLS=0",
         "-s MALLOC=emmalloc",
         "-s INLINING_LIMIT=1",
-        "-s USE_WEBNN=1",
     ],
     linkstatic = 1,
     deps = [
