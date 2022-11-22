@@ -14,8 +14,8 @@ function createWindow() {
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false,
+      nodeIntegrationInWorker: true,
       enableBlinkFeatures: "WebAssemblySimd;WebAssemblyThreads",
-      preload: path.join(app.getAppPath(), 'preload.js')
     }
   });
 

@@ -88,10 +88,10 @@ index 0f5cc4260..cd311d8e3 100644
          });
 diff --git a/src/library_webnn.js b/src/library_webnn.js
 new file mode 100644
-index 000000000..b14c88212
+index 000000000..f6831b962
 --- /dev/null
 +++ b/src/library_webnn.js
-@@ -0,0 +1,906 @@
+@@ -0,0 +1,907 @@
 +/**
 + * @license
 + * Copyright 2021 The Emscripten Authors
@@ -987,13 +987,14 @@ index 000000000..b14c88212
 +    return WebNN.mgrGraphBuilder.create(builder);
 +  },
 +
-+  wnnGraphCompute: function(graphId, inputsId, outputsId) {
++  wnnContextComputeSync: function(contextId, graphId, inputsId, outputsId) {
++    var context = WebNN.mgrContext.get(contextId);
 +    var graph = WebNN.mgrGraph.get(graphId);
 +    var inputs = WebNN.mgrNamedInputs.get(inputsId);
 +    var outputs = WebNN.mgrNamedOutputs.get(outputsId);
-+    graph["compute"](inputs, outputs);
++    context["compute"](graph, inputs, outputs)
 +  },
-+
++  
 +};
 +
 +autoAddDeps(LibraryWebNN, '$WebNN');
@@ -1420,10 +1421,10 @@ index 000000000..bdef1df3d
 +#endif  // WEBNN_ENUM_CLASS_BITMASKS_H_
 diff --git a/system/include/webnn/webnn.h b/system/include/webnn/webnn.h
 new file mode 100644
-index 000000000..1db1d432e
+index 000000000..7a97fa44e
 --- /dev/null
 +++ b/system/include/webnn/webnn.h
-@@ -0,0 +1,628 @@
+@@ -0,0 +1,630 @@
 +// Licensed under the Apache License, Version 2.0 (the "License");
 +// you may not use this file except in compliance with the License.
 +// You may obtain a copy of the License at
@@ -1485,10 +1486,12 @@ index 000000000..1db1d432e
 +typedef enum WNNBackendType {
 +    WNNBackendType_Null = 0x00000000,
 +    WNNBackendType_DirectML = 0x00000001,
-+    WNNBackendType_OpenVINO = 0x00000002,
-+    WNNBackendType_OneDNN = 0x00000003,
-+    WNNBackendType_MLAS = 0x00000004,
-+    WNNBackendType_XNNPACK = 0x00000005,
++    WNNBackendType_DirectMLX = 0x00000002,
++    WNNBackendType_OpenVINO = 0x00000003,
++    WNNBackendType_OneDNN = 0x00000004,
++    WNNBackendType_MLAS = 0x00000005,
++    WNNBackendType_XNNPACK = 0x00000006,
++    WNNBackendType_NNAPI = 0x00000007,
 +    WNNBackendType_Force32 = 0x7FFFFFFF
 +} WNNBackendType;
 +
@@ -1784,6 +1787,8 @@ index 000000000..1db1d432e
 +typedef WNNOperatorArray (*WebnnProcCreateOperatorArray)();
 +
 +// Procs of Context
++typedef void (*WebnnProcContextCompute)(WNNContext context, WNNGraph graph, WNNNamedInputs inputs, WNNNamedOutputs outputs, WNNComputeAsyncCallback callback, void * userdata);
++typedef void (*WebnnProcContextComputeSync)(WNNContext context, WNNGraph graph, WNNNamedInputs inputs, WNNNamedOutputs outputs);
 +typedef void (*WebnnProcContextInjectError)(WNNContext context, WNNErrorType type, char const * message);
 +typedef bool (*WebnnProcContextPopErrorScope)(WNNContext context, WNNErrorCallback callback, void * userdata);
 +typedef void (*WebnnProcContextPushErrorScope)(WNNContext context, WNNErrorFilter filter);
@@ -1796,8 +1801,6 @@ index 000000000..1db1d432e
 +typedef void (*WebnnProcFusionOperatorRelease)(WNNFusionOperator fusionOperator);
 +
 +// Procs of Graph
-+typedef void (*WebnnProcGraphCompute)(WNNGraph graph, WNNNamedInputs inputs, WNNNamedOutputs outputs);
-+typedef void (*WebnnProcGraphComputeAsync)(WNNGraph graph, WNNNamedInputs inputs, WNNNamedOutputs outputs, WNNComputeAsyncCallback callback, void * userdata);
 +typedef void (*WebnnProcGraphReference)(WNNGraph graph);
 +typedef void (*WebnnProcGraphRelease)(WNNGraph graph);
 +
@@ -1920,6 +1923,8 @@ index 000000000..1db1d432e
 +WEBNN_EXPORT WNNOperatorArray webnnCreateOperatorArray();
 +
 +// Methods of Context
++WEBNN_EXPORT void wnnContextCompute(WNNContext context, WNNGraph graph, WNNNamedInputs inputs, WNNNamedOutputs outputs, WNNComputeAsyncCallback callback, void * userdata);
++WEBNN_EXPORT void wnnContextComputeSync(WNNContext context, WNNGraph graph, WNNNamedInputs inputs, WNNNamedOutputs outputs);
 +WEBNN_EXPORT void wnnContextInjectError(WNNContext context, WNNErrorType type, char const * message);
 +WEBNN_EXPORT bool wnnContextPopErrorScope(WNNContext context, WNNErrorCallback callback, void * userdata);
 +WEBNN_EXPORT void wnnContextPushErrorScope(WNNContext context, WNNErrorFilter filter);
@@ -1932,8 +1937,6 @@ index 000000000..1db1d432e
 +WEBNN_EXPORT void wnnFusionOperatorRelease(WNNFusionOperator fusionOperator);
 +
 +// Methods of Graph
-+WEBNN_EXPORT void wnnGraphCompute(WNNGraph graph, WNNNamedInputs inputs, WNNNamedOutputs outputs);
-+WEBNN_EXPORT void wnnGraphComputeAsync(WNNGraph graph, WNNNamedInputs inputs, WNNNamedOutputs outputs, WNNComputeAsyncCallback callback, void * userdata);
 +WEBNN_EXPORT void wnnGraphReference(WNNGraph graph);
 +WEBNN_EXPORT void wnnGraphRelease(WNNGraph graph);
 +
@@ -2054,10 +2057,10 @@ index 000000000..1db1d432e
 +#endif // WEBNN_H_
 diff --git a/system/include/webnn/webnn_cpp.h b/system/include/webnn/webnn_cpp.h
 new file mode 100644
-index 000000000..ee822ab80
+index 000000000..f13287eb2
 --- /dev/null
 +++ b/system/include/webnn/webnn_cpp.h
-@@ -0,0 +1,635 @@
+@@ -0,0 +1,637 @@
 +#ifndef WEBNN_CPP_H_
 +#define WEBNN_CPP_H_
 +
@@ -2077,10 +2080,12 @@ index 000000000..ee822ab80
 +    enum class BackendType : uint32_t {
 +        Null = 0x00000000,
 +        DirectML = 0x00000001,
-+        OpenVINO = 0x00000002,
-+        OneDNN = 0x00000003,
-+        MLAS = 0x00000004,
-+        XNNPACK = 0x00000005,
++        DirectMLX = 0x00000002,
++        OpenVINO = 0x00000003,
++        OneDNN = 0x00000004,
++        MLAS = 0x00000005,
++        XNNPACK = 0x00000006,
++        NNAPI = 0x00000007,
 +    };
 +
 +    enum class ConvTranspose2dFilterOperandLayout : uint32_t {
@@ -2290,6 +2295,8 @@ index 000000000..ee822ab80
 +        using ObjectBase::ObjectBase;
 +        using ObjectBase::operator=;
 +
++        void Compute(Graph const& graph, NamedInputs const& inputs, NamedOutputs const& outputs, ComputeAsyncCallback callback, void * userdata) const;
++        void ComputeSync(Graph const& graph, NamedInputs const& inputs, NamedOutputs const& outputs) const;
 +        void InjectError(ErrorType type, char const * message) const;
 +        bool PopErrorScope(ErrorCallback callback, void * userdata) const;
 +        void PushErrorScope(ErrorFilter filter) const;
@@ -2318,8 +2325,6 @@ index 000000000..ee822ab80
 +        using ObjectBase::ObjectBase;
 +        using ObjectBase::operator=;
 +
-+        void Compute(NamedInputs const& inputs, NamedOutputs const& outputs) const;
-+        void ComputeAsync(NamedInputs const& inputs, NamedOutputs const& outputs, ComputeAsyncCallback callback, void * userdata) const;
 +
 +      private:
 +        friend ObjectBase<Graph, WNNGraph>;
@@ -2695,10 +2700,10 @@ index 000000000..ee822ab80
 +#endif // WEBNN_CPP_H_
 diff --git a/system/lib/webnn/webnn_cpp.cpp b/system/lib/webnn/webnn_cpp.cpp
 new file mode 100644
-index 000000000..b5826d7a8
+index 000000000..736af0226
 --- /dev/null
 +++ b/system/lib/webnn/webnn_cpp.cpp
-@@ -0,0 +1,1019 @@
+@@ -0,0 +1,1021 @@
 +#include "webnn/webnn_cpp.h"
 +
 +namespace wnn {
@@ -2719,10 +2724,12 @@ index 000000000..b5826d7a8
 +
 +    static_assert(static_cast<uint32_t>(BackendType::Null) == WNNBackendType_Null, "value mismatch for BackendType::Null");
 +    static_assert(static_cast<uint32_t>(BackendType::DirectML) == WNNBackendType_DirectML, "value mismatch for BackendType::DirectML");
++    static_assert(static_cast<uint32_t>(BackendType::DirectMLX) == WNNBackendType_DirectMLX, "value mismatch for BackendType::DirectMLX");
 +    static_assert(static_cast<uint32_t>(BackendType::OpenVINO) == WNNBackendType_OpenVINO, "value mismatch for BackendType::OpenVINO");
 +    static_assert(static_cast<uint32_t>(BackendType::OneDNN) == WNNBackendType_OneDNN, "value mismatch for BackendType::OneDNN");
 +    static_assert(static_cast<uint32_t>(BackendType::MLAS) == WNNBackendType_MLAS, "value mismatch for BackendType::MLAS");
 +    static_assert(static_cast<uint32_t>(BackendType::XNNPACK) == WNNBackendType_XNNPACK, "value mismatch for BackendType::XNNPACK");
++    static_assert(static_cast<uint32_t>(BackendType::NNAPI) == WNNBackendType_NNAPI, "value mismatch for BackendType::NNAPI");
 +
 +    // ConvTranspose2dFilterOperandLayout
 +
@@ -3208,6 +3215,12 @@ index 000000000..b5826d7a8
 +    static_assert(sizeof(Context) == sizeof(WNNContext), "sizeof mismatch for Context");
 +    static_assert(alignof(Context) == alignof(WNNContext), "alignof mismatch for Context");
 +
++    void Context::Compute(Graph const& graph, NamedInputs const& inputs, NamedOutputs const& outputs, ComputeAsyncCallback callback, void * userdata) const {
++        wnnContextCompute(GetHandle(), graph.GetHandle(), inputs.GetHandle(), outputs.GetHandle(), callback, reinterpret_cast<void * >(userdata));
++    }
++    void Context::ComputeSync(Graph const& graph, NamedInputs const& inputs, NamedOutputs const& outputs) const {
++        wnnContextComputeSync(GetHandle(), graph.GetHandle(), inputs.GetHandle(), outputs.GetHandle());
++    }
 +    void Context::InjectError(ErrorType type, char const * message) const {
 +        wnnContextInjectError(GetHandle(), static_cast<WNNErrorType>(type), reinterpret_cast<char const * >(message));
 +    }
@@ -3253,12 +3266,6 @@ index 000000000..b5826d7a8
 +    static_assert(sizeof(Graph) == sizeof(WNNGraph), "sizeof mismatch for Graph");
 +    static_assert(alignof(Graph) == alignof(WNNGraph), "alignof mismatch for Graph");
 +
-+    void Graph::Compute(NamedInputs const& inputs, NamedOutputs const& outputs) const {
-+        wnnGraphCompute(GetHandle(), inputs.GetHandle(), outputs.GetHandle());
-+    }
-+    void Graph::ComputeAsync(NamedInputs const& inputs, NamedOutputs const& outputs, ComputeAsyncCallback callback, void * userdata) const {
-+        wnnGraphComputeAsync(GetHandle(), inputs.GetHandle(), outputs.GetHandle(), callback, reinterpret_cast<void * >(userdata));
-+    }
 +    void Graph::WebnnReference(WNNGraph handle) {
 +        if (handle != nullptr) {
 +            wnnGraphReference(handle);
