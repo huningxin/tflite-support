@@ -1,6 +1,7 @@
 'use strict';
 
 importScripts('./tflite_model_runner_cc_simd.js');
+importScripts('https://cdn.jsdelivr.net/npm/@webmachinelearning/webnn-polyfill/dist/webnn-polyfill.js');
 
 var modelRunnerResult;
 var modelRunner;

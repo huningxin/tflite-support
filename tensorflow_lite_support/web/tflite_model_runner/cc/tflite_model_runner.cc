@@ -104,7 +104,7 @@ TfLiteStatus TFLiteWebModelRunner::InitFromBuffer(
   if (options_.enable_webnn_delegate) {
     TfLiteWebNNDelegateOptions options =
         TfLiteWebNNDelegateOptionsDefault();
-    options.devicePreference = options_.webnn_device_preference;
+    options.deviceType = options_.webnn_device_preference;
     auto webnn_delegate = TfLiteWebNNDelegateCreate(&options);
     auto delegate_ptr = tflite::Interpreter::TfLiteDelegatePtr(webnn_delegate, [](TfLiteDelegate* delegate) {
       TfLiteWebNNDelegateDelete(delegate);
