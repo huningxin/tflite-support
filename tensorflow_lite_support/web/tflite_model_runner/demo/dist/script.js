@@ -1,87 +1,33 @@
+
+// Create the web worker.
+const worker = new Worker('worker.js');
+
 async function start() {
   //////////////////////////////////////////////////////////////////////////////
   // Create the model runner with the model.
 
   let modelPath = document.getElementById('model').value + '.tflite';
-  const startTs = Date.now();
 
-  // Load WASM module and model.
-  const [module, modelArrayBuffer] = await Promise.all([
-    tflite_model_runner_ModuleFactory(),
-    (await fetch(modelPath)).arrayBuffer(),
+  // Send init message to web worker. 
+  worker.postMessage([
+    'create',
+    modelPath,
+    document.getElementById('webnnDelegate').checked,
+    document.getElementById('webnnDevice').value,
   ]);
-  const modelBytes = new Uint8Array(modelArrayBuffer);
-  const offset = module._malloc(modelBytes.length);
-  module.HEAPU8.set(modelBytes, offset);
+  
+  // Get the load time from returned message.
+  const loadFinishedMs = await new Promise((resolve, reject) => {
+    worker.onmessage = function (event) {
+      resolve(event.data);
+    };
+  });
+  console.log(loadFinishedMs);
 
-  // Set webnn-polyfill backend if needed
-  if (navigator.ml.createContext().tf !== undefined) {
-    const tf = navigator.ml.createContext().tf;
-    const devicePreference = parseInt(document.getElementById('webnnDevice').value);
-    if (devicePreference === 1) {
-      tf.setBackend('webgl');
-    } else {
-      tf.setBackend('wasm');
-    }
-    await tf.ready();
-  }
-
-  // Create model runner.
-  const modelRunnerResult =
-      module.TFLiteWebModelRunner.CreateFromBufferAndOptions(
-          offset, modelBytes.length, {
-            numThreads: Math.min(
-                4, Math.max(1, (navigator.hardwareConcurrency || 1) / 2)),
-            enableWebNNDelegate: document.getElementById('webnnDelegate').checked,
-            webNNDevicePreference: parseInt(document.getElementById('webnnDevice').value)
-          });
-  if (!modelRunnerResult.ok()) {
-    throw new Error(
-        'Failed to create TFLiteWebModelRunner: ' + modelRunner.errorMessage());
-  }
-  const modelRunner = modelRunnerResult.value();
-  const loadFinishedMs = Date.now() - startTs;
   document.querySelector('.loading-stats').textContent =
       `Loaded WASM module and TFLite model ${modelPath} in ${
           loadFinishedMs}ms`;
   document.querySelector('.content').classList.remove('hide');
-
-  //////////////////////////////////////////////////////////////////////////////
-  // Get input and output info.
-
-  const inputs = callAndDelete(
-      modelRunner.GetInputs(), results => convertCppVectorToArray(results));
-  const input = inputs[0];
-  const outputs = callAndDelete(
-      modelRunner.GetOutputs(), results => convertCppVectorToArray(results));
-  const output = outputs[0];
-
-
-
-  //////////////////////////////////////////////////////////////////////////////
-  // Set input tensor data from the image (224 x 224 x 3).
-
-  const {vals, width, height} = fromPixels(document.querySelector('img'));
-  if (!vals) return;
-  const inputBuffer = input.data();
-  const inputData = new Float32Array(inputBuffer.length);
-  let pixelIndex = 0;
-  for (let i = 0; i < width; i++) {
-    for (let j = 0; j < height; j++) {
-      const valStartIndex = pixelIndex * 4;
-      const inputIndex = pixelIndex * 3;
-      inputData[inputIndex] = (vals[valStartIndex] - 127.5) / 127.5;
-      inputData[inputIndex + 1] = (vals[valStartIndex + 1] - 127.5) / 127.5;
-      inputData[inputIndex + 2] = (vals[valStartIndex + 2] - 127.5) / 127.5;
-      pixelIndex += 1;
-    }
-  }
-  inputBuffer.set(inputData);
-
-
-
-  //////////////////////////////////////////////////////////////////////////////
-  // Infer, get output tensor, and sort by logit values in reverse.
 
   // Set 'numRuns' param to run inference multiple times
   // numRuns includes the first run of inference
@@ -95,23 +41,15 @@ async function start() {
   }
   numRuns = numRuns === null ? 1 : parseInt(numRuns);
 
-  const inferTimes = [];
-  for (let i = 0; i < numRuns; i++) {
-    const start = performance.now();
-    const success = modelRunner.Infer();
-    const inferTime = (performance.now() - start).toFixed(2);
-    if (!success) return;
-    console.log(`Infer time ${i+1}: ${inferTime} ms`);
-    inferTimes.push(Number(inferTime));
-  }
-
-  const result = Array.from(output.data());
-  result.shift();  // Remove the first logit which is the background noise.
-  const sortedResult = result
-                           .map((logit, i) => {
-                             return {i, logit};
-                           })
-                           .sort((a, b) => b.logit - a.logit);
+  const { vals, width, height } = fromPixels(document.querySelector('img'));
+  //Send parameters of input 
+  worker.postMessage(['infer', { vals, width, height }, numRuns]);
+  const {inferTimes, sortedResult} = await new Promise((resolve, reject) => {
+    // Receive the infer result from the worker
+    worker.onmessage = function (event) {
+      resolve(event.data);
+    };
+  });
 
   //////////////////////////////////////////////////////////////////////////////
   // Show result.
@@ -205,30 +143,6 @@ function fromPixels(pixels) {
     vals = fromPixels2DContext.getImageData(0, 0, width, height).data;
   }
   return {vals, width, height};
-}
-
-/** Converts the given c++ vector to a JS array. */
-function convertCppVectorToArray(vector) {
-  if (vector == null) return [];
-
-  const result = [];
-  for (let i = 0; i < vector.size(); i++) {
-    const item = vector.get(i);
-    result.push(item);
-  }
-  return result;
-}
-
-/**
- * Calls the given function with the given deletable argument, ensuring that
- * the argument gets deleted afterwards (even if the function throws an error).
- */
-function callAndDelete(arg, func) {
-  try {
-    return func(arg);
-  } finally {
-    if (arg != null) arg.delete();
-  }
 }
 
 const IMAGENET_CLASSES = {
