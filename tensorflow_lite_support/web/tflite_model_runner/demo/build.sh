@@ -23,4 +23,7 @@ cp ${WASM_DIR}/tflite_model_runner_cc_threaded_simd.js \
    ${WASM_DIR}/tflite_model_runner_cc_threaded_simd.worker.js \
    dist/
 
-
+bazel build --copt="-fPIC" //tensorflow_lite_support/web/tflite_model_runner/cc:tflite_webnn_delegate_wasm
+WASM_DIR=../../../../bazel-bin/tensorflow_lite_support/web/tflite_model_runner/cc/tflite_webnn_delegate_wasm/
+cp ${WASM_DIR}/webnn_external_delegate_wasm.wasm \
+   dist/
