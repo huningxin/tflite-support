@@ -1,5 +1,6 @@
 'use strict';
 
+// built-in webnn delegate
 importScripts('./tflite_model_runner_cc_simd.js');
 importScripts('https://cdn.jsdelivr.net/npm/@webmachinelearning/webnn-polyfill/dist/webnn-polyfill.js');
 
@@ -8,11 +9,11 @@ var modelRunner;
 // Receive the message from the main thread
 onmessage = async (message) => {
   if (message) {
-    //Create delegate or infer depends on the first data  
-    switch (message.data[0]) {
-      case 'create':
-        const startTs = Date.now();
-        const modelPath = message.data[1];
+    //Load model or infer depends on the first data
+    switch (message.data.action) {
+      case 'load':
+        const startTs = performance.now();
+        const modelPath = message.data.modelPath;
         // Load WASM module and model.
         const [module, modelArrayBuffer] = await Promise.all([
           tflite_model_runner_ModuleFactory(),
@@ -33,8 +34,8 @@ onmessage = async (message) => {
                 4,
                 Math.max(1, (navigator.hardwareConcurrency || 1) / 2)
               ),
-              enableWebNNDelegate: message.data[2],
-              webNNDevicePreference: parseInt(message.data[3]),
+              enableWebNNDelegate: message.data.enableWebNNDelegate,
+              webNNDevicePreference: parseInt(message.data.webNNDevicePreference),
             }
           );
 
@@ -45,7 +46,7 @@ onmessage = async (message) => {
           );
         }
         modelRunner = modelRunnerResult.value();
-        const loadFinishedMs = Date.now() - startTs;
+        const loadFinishedMs = (performance.now() - startTs).toFixed(2);
         postMessage(loadFinishedMs);
         break;
 
@@ -65,31 +66,14 @@ onmessage = async (message) => {
 
         //////////////////////////////////////////////////////////////////////////////
         // Set input tensor data from the image (224 x 224 x 3).
-
-        const { vals, width, height } = message.data[1]
-        if (!vals) return;
         const inputBuffer = input.data();
-        const inputData = new Float32Array(inputBuffer.length);
-        let pixelIndex = 0;
-        for (let i = 0; i < width; i++) {
-          for (let j = 0; j < height; j++) {
-            const valStartIndex = pixelIndex * 4;
-            const inputIndex = pixelIndex * 3;
-            inputData[inputIndex] = (vals[valStartIndex] - 127.5) / 127.5;
-            inputData[inputIndex + 1] =
-              (vals[valStartIndex + 1] - 127.5) / 127.5;
-            inputData[inputIndex + 2] =
-              (vals[valStartIndex + 2] - 127.5) / 127.5;
-            pixelIndex += 1;
-          }
-        }
-        inputBuffer.set(inputData);
+        inputBuffer.set(message.data.buffer);
 
         //////////////////////////////////////////////////////////////////////////////
         // Infer, get output tensor, and sort by logit values in reverse.
 
 
-        const numRuns = message.data[2]
+        const numRuns = message.data.numRuns;
         const inferTimes = [];
         for (let i = 0; i < numRuns; i++) {
           const start = performance.now();
@@ -107,7 +91,7 @@ onmessage = async (message) => {
             return { i, logit };
           })
           .sort((a, b) => b.logit - a.logit);
-        postMessage({sortedResult, inferTimes})
+        postMessage({sortedResult, inferTimes});
       default:
         break;
     }

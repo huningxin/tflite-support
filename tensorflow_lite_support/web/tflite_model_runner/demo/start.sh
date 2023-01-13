@@ -1,4 +1,4 @@
 #!/bin/bash
 
-cp -f src/* dist/
+cp -rf src/* dist/
 npx http-server dist/ -S
