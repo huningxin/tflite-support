@@ -1,6 +1,7 @@
 
 // Create the web worker.
-const worker = new Worker('worker.js');
+const builtinDelegateWorker = new Worker('builtin_delegate_worker.js');
+const externalDelegateWorker = new Worker('external_delegate_worker.js');
 
 async function start() {
   //////////////////////////////////////////////////////////////////////////////
@@ -8,25 +9,21 @@ async function start() {
 
   let modelPath = document.getElementById('model').value + '.tflite';
 
-  // Send init message to web worker. 
-  worker.postMessage([
-    'create',
+  const tfliteRunnerType = document.getElementById('tfliteRunner').value;
+  const worker = tfliteRunnerType == 'builtin' ? builtinDelegateWorker : externalDelegateWorker;
+
+  // Load tflite model and get the load time
+  const loadFinishedMs = await postAndListenMessage(worker, {
+    action: 'load',
     modelPath,
-    document.getElementById('webnnDelegate').checked,
-    document.getElementById('webnnDevice').value,
-  ]);
-  
-  // Get the load time from returned message.
-  const loadFinishedMs = await new Promise((resolve, reject) => {
-    worker.onmessage = function (event) {
-      resolve(event.data);
-    };
+    enableWebNNDelegate: document.getElementById('webnnDelegate').checked,
+    webNNDevicePreference: document.getElementById('webnnDevice').value,
   });
-  console.log(loadFinishedMs);
+  console.log('Model load time: ', loadFinishedMs);
 
   document.querySelector('.loading-stats').textContent =
       `Loaded WASM module and TFLite model ${modelPath} in ${
-          loadFinishedMs}ms`;
+          loadFinishedMs} ms`;
   document.querySelector('.content').classList.remove('hide');
 
   // Set 'numRuns' param to run inference multiple times
@@ -41,16 +38,72 @@ async function start() {
   }
   numRuns = numRuns === null ? 1 : parseInt(numRuns);
 
-  const { vals, width, height } = fromPixels(document.querySelector('img'));
-  //Send parameters of input 
-  worker.postMessage(['infer', { vals, width, height }, numRuns]);
-  const {inferTimes, sortedResult} = await new Promise((resolve, reject) => {
-    // Receive the infer result from the worker
-    worker.onmessage = function (event) {
-      resolve(event.data);
-    };
+  // Preprocessing
+  const input = tf.tidy(() => {
+    // Get pixels data.
+    const img = tf.browser.fromPixels(document.querySelector('img'));
+    // Normalize.
+    //
+    // Since the images are already 224*224 that matches the model's input size,
+    // we don't resize them here.
+    let input = tf.sub(tf.div(tf.expandDims(img), 127.5), 1);
+    return input;
   });
 
+  // Run the inference.
+  
+let inputData = input.dataSync();
+const inputMessage = {
+  action: 'infer',
+  buffer: inputData
+}
+// warm up
+console.log('Do warm up....');
+const result = await postAndListenMessage(worker, inputMessage);
+tf.dispose(input);
+
+// Loop for performance test
+console.log('----------------Start performance measurement-----------------');
+const inferTimes = [];
+const overheads = [];
+for (let i = 0; i < numRuns; i++) {
+  // Simulate streaming input
+  // Preprocessing
+  const input = tf.tidy(() => {
+    // Get pixels data.
+    const img = tf.browser.fromPixels(document.querySelector('img'));
+    // Normalize.
+    //
+    // Since the images are already 224*224 that matches the model's input size,
+    // we don't resize them here.
+    let input = tf.sub(tf.div(tf.expandDims(img), 127.5), 1);
+    return input;
+  });
+  const inputData = input.dataSync();
+
+  const inputMessage = {
+    action: 'infer',
+    buffer: inputData
+  }
+  const start = performance.now();
+  const result = await postAndListenMessage(worker, inputMessage);
+  const totalTime = performance.now() - start;
+  const overhead = totalTime - result.inferTime;
+  console.log(`total time ${i+1}: `, totalTime.toFixed(2));
+  console.log(`overhead ${i+1}: `, overhead.toFixed(2));
+  inferTimes.push(totalTime);
+  overheads.push(overhead);
+}
+const averageOverhead = (overheads.reduce((acc, curr) => acc + curr, 0) / overheads.length).toFixed(2);
+console.log('average overhead: ', averageOverhead);
+console.log('----------------End performance measurement-----------------');
+let outputResult = Array.from(result.result);
+outputResult.shift(); // Remove the first logit which is the background noise.
+const sortedResult = outputResult
+  .map((logit, i) => {
+    return { i, logit };
+  })
+  .sort((a, b) => b.logit - a.logit);
   //////////////////////////////////////////////////////////////////////////////
   // Show result.
 
@@ -64,85 +117,43 @@ async function start() {
     document.querySelector('.result').innerHTML =
     `${IMAGENET_CLASSES[classIndex]} (score: ${score.toFixed(3)}) <br>
       numRuns: ${numRuns} <br> average time: ${averageTime} ms <br>
-      median time: ${medianTime} ms <br> max Time: ${maxTime} ms <br>
-      min Time: ${minTime} ms`;
+      median time: ${medianTime} ms <br> max Time: ${maxTime.toFixed(2)} ms <br>
+      min Time: ${minTime.toFixed(2)} ms <br>
+      average overhead: ${averageOverhead} ms`;
   } else {
     document.querySelector('.result').textContent =
     `${IMAGENET_CLASSES[classIndex]} (score: ${score.toFixed(3)}, latency: ${
-      inferTimes[0]}ms)`;
+      inferTimes[0].toFixed(2)} ms)`;
   }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 // Helper functions.
 
+async function postAndListenMessage(worker, message) {
+  // Send message to web worker.
+  if (message.action == 'infer') {
+    // transfer buffer rather than copy
+    worker.postMessage(message, [message.buffer.buffer]);
+  } else {
+    worker.postMessage(message);
+  }
+  
+  // Listen and receive message from worker
+  const result = await new Promise((resolve, reject) => {
+    worker.onmessage = (event) => {
+      resolve(event.data);
+    };
+  });
+
+  return result;
+}
+
 function getMedianValue(array) {
   array = array.sort((a, b) => a - b);
   const medianValue = array.length % 2 !== 0 ? array[Math.floor(array.length / 2)] :
       (array[array.length / 2 - 1] + array[array.length / 2]) / 2;
   return medianValue.toFixed(2);
-}
-
-let fromPixels2DContext;
-
-/** Gets the raw pixel data from the given HTML element. */
-function fromPixels(pixels) {
-  if (pixels == null) {
-    throw new Error('pixels passed to fromPixels() can not be null');
-  }
-  let isImageData = false;
-  let isVideo = false;
-  let isImage = false;
-  let isCanvasLike = false;
-  if (typeof (ImageData) !== 'undefined' && pixels instanceof ImageData) {
-    isImageData = true;
-  } else if (
-      typeof (HTMLVideoElement) !== 'undefined' &&
-      pixels instanceof HTMLVideoElement) {
-    isVideo = true;
-  } else if (
-      typeof (HTMLImageElement) !== 'undefined' &&
-      pixels instanceof HTMLImageElement) {
-    isImage = true;
-    // tslint:disable-next-line: no-any
-  } else if (pixels.getContext != null) {
-    isCanvasLike = true;
-  } else {
-    throw new Error(
-        'pixels passed to fromPixels() must be either an ' +
-        `HTMLVideoElement, HTMLImageElement, HTMLCanvasElement, ImageData ` +
-        `in browser, or OffscreenCanvas, ImageData in webworker` +
-        ` or {data: Uint32Array, width: number, height: number}, ` +
-        `but was ${pixels.constructor.name}`);
-  }
-  if (isVideo) {
-    const HAVE_CURRENT_DATA_READY_STATE = 2;
-    if (isVideo && pixels.readyState < HAVE_CURRENT_DATA_READY_STATE) {
-      throw new Error(
-          'The video element has not loaded data yet. Please wait for ' +
-          '`loadeddata` event on the <video> element.');
-    }
-  }
-  const [width, height] = isVideo ? [pixels.videoWidth, pixels.videoHeight] :
-                                    [pixels.width, pixels.height];
-  let vals;
-
-  if (isCanvasLike) {
-    vals =
-        // tslint:disable-next-line:no-any
-        pixels.getContext('2d').getImageData(0, 0, width, height).data;
-  } else if (isImageData) {
-    vals = pixels.data;
-  } else if (isImage || isVideo) {
-    if (fromPixels2DContext == null) {
-      fromPixels2DContext = document.createElement('canvas').getContext('2d');
-    }
-    fromPixels2DContext.canvas.width = width;
-    fromPixels2DContext.canvas.height = height;
-    fromPixels2DContext.drawImage(pixels, 0, 0, width, height);
-    vals = fromPixels2DContext.getImageData(0, 0, width, height).data;
-  }
-  return {vals, width, height};
 }
 
 const IMAGENET_CLASSES = {
