@@ -173,10 +173,10 @@ index 9121bd661b4..e15533d2664 100644
  }
 diff --git a/tensorflow/lite/delegates/webnn/BUILD b/tensorflow/lite/delegates/webnn/BUILD
 new file mode 100644
-index 00000000000..b5d1ebc282b
+index 00000000000..ca0648054a4
 --- /dev/null
 +++ b/tensorflow/lite/delegates/webnn/BUILD
-@@ -0,0 +1,697 @@
+@@ -0,0 +1,698 @@
 +load("//tensorflow/lite:special_rules.bzl", "tflite_portable_test_suite_combined")
 +load("//tensorflow:tensorflow.bzl", "get_compatible_with_portable")
 +load("//tensorflow/lite:build_def.bzl", "tflite_cc_shared_object")
@@ -211,6 +211,7 @@ index 00000000000..b5d1ebc282b
 +        "//tensorflow/lite/c:common",
 +        "//tensorflow/lite/schema:schema_fbs",
 +        "//tensorflow/lite/kernels/internal/utils:sparsity_format_converter",
++        "//tensorflow/lite/kernels:kernel_util",
 +        "@FP16",
 +    ],
 +)
@@ -14519,10 +14520,10 @@ index 00000000000..ef2dd7c66c3
 \ No newline at end of file
 diff --git a/tensorflow/lite/delegates/webnn/webnn_delegate.cc b/tensorflow/lite/delegates/webnn/webnn_delegate.cc
 new file mode 100644
-index 00000000000..511940b549e
+index 00000000000..3a049ad118e
 --- /dev/null
 +++ b/tensorflow/lite/delegates/webnn/webnn_delegate.cc
-@@ -0,0 +1,2977 @@
+@@ -0,0 +1,3014 @@
 +/* Copyright 2021 The TensorFlow Authors. All Rights Reserved.
 +
 +Licensed under the Apache License, Version 2.0 (the "License");
@@ -14564,6 +14565,7 @@ index 00000000000..511940b549e
 +#include "tensorflow/lite/c/common.h"
 +#include "tensorflow/lite/minimal_logging.h"
 +#include "tensorflow/lite/kernels/internal/utils/sparsity_format_converter.h"
++#include "tensorflow/lite/kernels/kernel_util.h"
 +
 +namespace tflite {
 +namespace webnn {
@@ -14757,6 +14759,11 @@ index 00000000000..511940b549e
 +      if (inputs.count(t) != 0 || quasi_static_tensors.count(t) != 0) {
 +        emscripten::val desc = emscripten::val::object();
 +        desc.set("type", emscripten::val(datatype));
++        // Workaround for single-value operand as which is not supported in Chromium yet
++        // TODO: remove this workaround once it is supported
++        if (dims.size() == 0) {
++          dims = {1};
++        }
 +        desc.set("dimensions", emscripten::val::array(dims));
 +
 +        emscripten::val operand = emscripten::val::object();
@@ -14765,9 +14772,18 @@ index 00000000000..511940b549e
 +          std::string name = std::to_string(t);
 +          operand = wnn_builder.call<emscripten::val>("input", name, desc);
 +        } else {
-+          auto data_size = context->tensors[t].bytes / 4;
-+          emscripten::val view{ emscripten::typed_memory_view(data_size, static_cast<const float*>(data)) };
-+          operand = wnn_builder.call<emscripten::val>("constant", desc, view);
++          if (dims.size() == 0) {
++            // Create a single-value operand from the specified number of the specified type.
++            operand = wnn_builder.call<emscripten::val>(
++                "constant", static_cast<const float*>(data)[0],
++                emscripten::val(datatype));
++          } else {
++            // Create an operand for a graph constant.
++            auto data_size = context->tensors[t].bytes / 4;
++            emscripten::val view{emscripten::typed_memory_view(
++                data_size, static_cast<const float*>(data))};
++            operand = wnn_builder.call<emscripten::val>("constant", desc, view);
++          }
 +        }
 +        webnn_operands.insert(std::make_pair(t, operand));
 +      }
@@ -15964,32 +15980,48 @@ index 00000000000..511940b549e
 +    TF_LITE_ENSURE_STATUS(CheckTensorStaticAllocation(
 +        logging_context, axes_tensor, axes_tensor_id, node_index));
 +
-+    if (axes_tensor.dims->data[0] != 2) {
-+      TF_LITE_MAYBE_KERNEL_LOG(
-+          logging_context,
-+          "unsupported MEAN reduction along %d axes in node %d",
-+          axes_tensor.dims->data[0], node_index);
-+      return kTfLiteError;
-+    }
-+
 +    const int32_t* axes_data =
 +        reinterpret_cast<const int32_t*>(axes_tensor.data.data);
-+    if (std::min(axes_data[0], axes_data[1]) != 1 ||
-+        std::max(axes_data[0], axes_data[1]) != 2) {
-+      TF_LITE_MAYBE_KERNEL_LOG(logging_context,
-+                               "unsupported MEAN reduction along non-spatial "
-+                               "axes %d and %d in node %d",
-+                               std::min(axes_data[0], axes_data[1]),
-+                               std::max(axes_data[0], axes_data[1]),
-+                               node_index);
-+      return kTfLiteError;
++    const int num_reduction_axes = NumElements(&axes_tensor);
++    switch (num_reduction_axes) {
++      case 1:
++        if (axes_data[0] != 2) {
++          TF_LITE_MAYBE_KERNEL_LOG(
++              logging_context,
++              "unsupported MEAN reduction along non-spatial "
++              "axis %d in node %d",
++              axes_data[0], node_index);
++          return kTfLiteError;
++        }
++        break;
++      case 2:
++        if (std::min(axes_data[0], axes_data[1]) != 1 ||
++            std::max(axes_data[0], axes_data[1]) != 2) {
++          TF_LITE_MAYBE_KERNEL_LOG(
++              logging_context,
++              "unsupported MEAN reduction along non-spatial "
++              "axes %d and %d in node %d",
++              std::min(axes_data[0], axes_data[1]),
++              std::max(axes_data[0], axes_data[1]), node_index);
++          return kTfLiteError;
++        }
++        break;
++      default:
++        TF_LITE_MAYBE_KERNEL_LOG(
++            logging_context,
++            "unsupported MEAN reduction along %d axes in node %d",
++            SizeOfDimension(&axes_tensor, 0), node_index);
++        return kTfLiteError;
 +    }
 +
 +    const int output_tensor_id = node->outputs->data[0];
 +    const TfLiteTensor& output_tensor = tensors[output_tensor_id];
 +    TF_LITE_ENSURE_STATUS(CheckTensorFloat32Type(
 +        logging_context, output_tensor, output_tensor_id, node_index));
-+    const int expected_output_dims = reducer_params->keep_dims ? 4 : 2;
++    int expected_output_dims = 4;
++    if (!reducer_params->keep_dims) {
++      expected_output_dims -= num_reduction_axes;
++    }
 +    TF_LITE_ENSURE_STATUS(CheckTensorShape(logging_context, output_tensor,
 +                                           expected_output_dims,
 +                                           output_tensor_id));
@@ -15997,21 +16029,27 @@ index 00000000000..511940b549e
 +        logging_context, output_tensor, output_tensor_id, node_index));
 +
 +    if (detect_supported_op) {
-+      TF_LITE_ENSURE_STATUS(CheckWebNNOpSupport(builder, "reduceMean"));
++      TF_LITE_ENSURE_STATUS(CheckWebNNOpSupport(builder, "averagePool2d"));
++      if (num_reduction_axes != 2) {
++        TFLITE_LOG_PROD(
++            tflite::TFLITE_LOG_WARNING,
++            "WebNN only support TFLite's mean op with axis = [1, 2], "
++            "will fallback to default delegate.");
++        return kTfLiteError;
++      }
 +    } else {
-+      emscripten::val reduceOptions = emscripten::val::object();
-+      std::vector<int32_t> axes;
-+      axes.assign(&axes_data[0], &axes_data[0] + axes_tensor.dims->data[0]);
-+      reduceOptions.set("axes", emscripten::val::array(axes));
-+      reduceOptions.set("keepDimensions", emscripten::val(reducer_params->keep_dims));
-+      TF_LITE_ENSURE(logging_context, webnn_operands.at(input_tensor_id).as<bool>());
++      emscripten::val pool2dOptions = emscripten::val::object();
++      pool2dOptions.set("layout", emscripten::val("nhwc"));
++      TF_LITE_ENSURE(logging_context,
++                     webnn_operands.at(input_tensor_id).as<bool>());
 +
 +      webnn_operands.insert(std::make_pair(
 +          output_tensor_id,
-+          builder.call<emscripten::val>("reduceMean",
++          builder.call<emscripten::val>("averagePool2d",
 +                                        webnn_operands.at(input_tensor_id),
-+                                        reduceOptions)));
-+      TF_LITE_ENSURE(logging_context, webnn_operands.at(output_tensor_id).as<bool>());
++                                        pool2dOptions)));
++      TF_LITE_ENSURE(logging_context,
++                     webnn_operands.at(output_tensor_id).as<bool>());
 +    }
 +
 +    return kTfLiteOk;
@@ -16471,8 +16509,8 @@ index 00000000000..511940b549e
 +      }
 +    } else {
 +      emscripten::val options = emscripten::val::object();
-+      options.set("aTranspose", emscripten::val(false));
-+      options.set("bTranspose",  emscripten::val(true));
++      options.set("aTranspose", false);
++      options.set("bTranspose",  true);
 +      if (bias_tensor_id >= 0) {
 +        TF_LITE_ENSURE(logging_context, webnn_operands.at(bias_tensor_id).as<bool>());
 +        options.set("c", webnn_operands.at(bias_tensor_id));
@@ -16481,11 +16519,11 @@ index 00000000000..511940b549e
 +      TF_LITE_ENSURE(logging_context, webnn_operands.at(filter_tensor_id).as<bool>());
 +      if (fc_params->keep_num_dims || input_tensor.dims->size != 2) {
 +        // Reshape input to 2D tensor
-+        const int32_t n_inputs = input_channels;
-+        std::vector<int32_t> new_input_shape = {-1, n_inputs};
++        emscripten::val new_input_shape = emscripten::val::array();
++        new_input_shape.call<void>("push", emscripten::val::null());
++        new_input_shape.call<void>("push", input_channels);
 +        emscripten::val reshaped_input = builder.call<emscripten::val>(
-+            "reshape", webnn_operands.at(input_tensor_id),
-+            emscripten::val::array(new_input_shape));
++            "reshape", webnn_operands.at(input_tensor_id), new_input_shape);
 +        emscripten::val gemm = builder.call<emscripten::val>(
 +            "gemm", reshaped_input, webnn_operands.at(filter_tensor_id),
 +            options);

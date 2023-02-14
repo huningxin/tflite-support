@@ -19,7 +19,7 @@ async function start() {
     enableWebNNDelegate: document.getElementById('webnnDelegate').checked,
     webNNDevicePreference: document.getElementById('webnnDevice').value,
   });
-  console.log(loadFinishedMs);
+  console.log('Model load time: ', loadFinishedMs);
 
   document.querySelector('.loading-stats').textContent =
       `Loaded WASM module and TFLite model ${modelPath} in ${
@@ -46,18 +46,64 @@ async function start() {
     //
     // Since the images are already 224*224 that matches the model's input size,
     // we don't resize them here.
-    const input = tf.sub(tf.div(tf.expandDims(img), 127.5), 1);
+    let input = tf.sub(tf.div(tf.expandDims(img), 127.5), 1);
     return input;
   });
 
   // Run the inference.
   
-  const { inferTimes, sortedResult } = await postAndListenMessage(worker, {
-    action: 'infer',
-    buffer: input.dataSync(),
-    numRuns,
-  });
+let inputData = input.dataSync();
+const inputMessage = {
+  action: 'infer',
+  buffer: inputData
+}
+// warm up
+console.log('Do warm up....');
+const result = await postAndListenMessage(worker, inputMessage);
+tf.dispose(input);
 
+// Loop for performance test
+console.log('----------------Start performance measurement-----------------');
+const inferTimes = [];
+const overheads = [];
+for (let i = 0; i < numRuns; i++) {
+  // Simulate streaming input
+  // Preprocessing
+  const input = tf.tidy(() => {
+    // Get pixels data.
+    const img = tf.browser.fromPixels(document.querySelector('img'));
+    // Normalize.
+    //
+    // Since the images are already 224*224 that matches the model's input size,
+    // we don't resize them here.
+    let input = tf.sub(tf.div(tf.expandDims(img), 127.5), 1);
+    return input;
+  });
+  const inputData = input.dataSync();
+
+  const inputMessage = {
+    action: 'infer',
+    buffer: inputData
+  }
+  const start = performance.now();
+  const result = await postAndListenMessage(worker, inputMessage);
+  const totalTime = performance.now() - start;
+  const overhead = totalTime - result.inferTime;
+  console.log(`total time ${i+1}: `, totalTime.toFixed(2));
+  console.log(`overhead ${i+1}: `, overhead.toFixed(2));
+  inferTimes.push(totalTime);
+  overheads.push(overhead);
+}
+const averageOverhead = (overheads.reduce((acc, curr) => acc + curr, 0) / overheads.length).toFixed(2);
+console.log('average overhead: ', averageOverhead);
+console.log('----------------End performance measurement-----------------');
+let outputResult = Array.from(result.result);
+outputResult.shift(); // Remove the first logit which is the background noise.
+const sortedResult = outputResult
+  .map((logit, i) => {
+    return { i, logit };
+  })
+  .sort((a, b) => b.logit - a.logit);
   //////////////////////////////////////////////////////////////////////////////
   // Show result.
 
@@ -71,12 +117,13 @@ async function start() {
     document.querySelector('.result').innerHTML =
     `${IMAGENET_CLASSES[classIndex]} (score: ${score.toFixed(3)}) <br>
       numRuns: ${numRuns} <br> average time: ${averageTime} ms <br>
-      median time: ${medianTime} ms <br> max Time: ${maxTime} ms <br>
-      min Time: ${minTime} ms`;
+      median time: ${medianTime} ms <br> max Time: ${maxTime.toFixed(2)} ms <br>
+      min Time: ${minTime.toFixed(2)} ms <br>
+      average overhead: ${averageOverhead} ms`;
   } else {
     document.querySelector('.result').textContent =
     `${IMAGENET_CLASSES[classIndex]} (score: ${score.toFixed(3)}, latency: ${
-      inferTimes[0]} ms)`;
+      inferTimes[0].toFixed(2)} ms)`;
   }
 }
 
@@ -85,7 +132,7 @@ async function start() {
 
 async function postAndListenMessage(worker, message) {
   // Send message to web worker.
-  if (message.buffer) {
+  if (message.action == 'infer') {
     // transfer buffer rather than copy
     worker.postMessage(message, [message.buffer.buffer]);
   } else {

@@ -71,27 +71,14 @@ onmessage = async (message) => {
 
         //////////////////////////////////////////////////////////////////////////////
         // Infer, get output tensor, and sort by logit values in reverse.
+        const start = performance.now();
+        modelRunner.Infer();
+        const inferTime = performance.now() - start;
+        console.log(`Infer time: ${inferTime.toFixed(2)} ms`);
 
-
-        const numRuns = message.data.numRuns;
-        const inferTimes = [];
-        for (let i = 0; i < numRuns; i++) {
-          const start = performance.now();
-          const success = modelRunner.Infer();
-          const inferTime = (performance.now() - start).toFixed(2);
-          if (!success) return;
-          console.log(`Infer time ${i + 1}: ${inferTime} ms`);
-          inferTimes.push(Number(inferTime));
-        }
-
-        const result = Array.from(output.data());
-        result.shift(); // Remove the first logit which is the background noise.
-        const sortedResult = result
-          .map((logit, i) => {
-            return { i, logit };
-          })
-          .sort((a, b) => b.logit - a.logit);
-        postMessage({sortedResult, inferTimes});
+        let result = output.data();
+        result = result.slice(0);
+        postMessage({result, inferTime}, [result.buffer]);
       default:
         break;
     }

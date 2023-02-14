@@ -37,28 +37,23 @@ onmessage = async (message) => {
         break;
 
       case 'infer':
-        const numRuns = message.data.numRuns;
-        let inputData = message.data.buffer;
-        const inputTensor = tf.tensor(inputData, [1, 224, 224, 3]);
-        const inferTimes = [];
-        let outputTensor;
-        for (let i = 0; i < numRuns; i++) {
-          const start = performance.now();
-          outputTensor = tfliteModel.predict(inputTensor);
-          const inferTime = (performance.now() - start).toFixed(2);
-          if (!outputTensor) return;
-          console.log(`Infer time ${i + 1}: ${inferTime} ms`);
-          inferTimes.push(Number(inferTime));
-        }
-
-        const result = outputTensor.arraySync()[0];
-        result.shift(); // Remove the first logit which is the background noise.
-        const sortedResult = result
-          .map((logit, i) => {
-            return { i, logit };
-          })
-          .sort((a, b) => b.logit - a.logit);
-        postMessage({ sortedResult, inferTimes });
+        const inputData = message.data.buffer;
+        const tensorStart = performance.now();
+        const inputTensor = tf.tensor(inputData, [1, 224, 224, 3], 'float32');
+        console.log('Time for tensor generatation: ', (performance.now() - tensorStart).toFixed(2));
+        const start = performance.now();
+        const outputTensor = tfliteModel.predict(inputTensor);
+        const inferTime = performance.now() - start;
+        console.log(`Infer time: ${inferTime.toFixed(2)} ms`);
+        const start1 = performance.now()
+        let result = outputTensor.dataSync();
+        // Do copy since result's buffer is ArrayBuffer(33554432),
+        // at index 0 is not detachable and could not be transferred.
+        result = result.slice(0);
+        console.log("time for output data sync and copy: ", (performance.now() - start1).toFixed());
+        postMessage({result, inferTime}, [result.buffer]);
+        tf.dispose(inputTensor);
+        tf.dispose(outputTensor);
       default:
         break;
     }
