@@ -173,10 +173,10 @@ index 9121bd661b4..e15533d2664 100644
  }
 diff --git a/tensorflow/lite/delegates/webnn/BUILD b/tensorflow/lite/delegates/webnn/BUILD
 new file mode 100644
-index 00000000000..ca0648054a4
+index 00000000000..b6f3dcf8b7e
 --- /dev/null
 +++ b/tensorflow/lite/delegates/webnn/BUILD
-@@ -0,0 +1,698 @@
+@@ -0,0 +1,699 @@
 +load("//tensorflow/lite:special_rules.bzl", "tflite_portable_test_suite_combined")
 +load("//tensorflow:tensorflow.bzl", "get_compatible_with_portable")
 +load("//tensorflow/lite:build_def.bzl", "tflite_cc_shared_object")
@@ -210,6 +210,7 @@ index 00000000000..ca0648054a4
 +        "//tensorflow/lite:util",
 +        "//tensorflow/lite/c:common",
 +        "//tensorflow/lite/schema:schema_fbs",
++        "//tensorflow/lite/kernels/internal:tensor",
 +        "//tensorflow/lite/kernels/internal/utils:sparsity_format_converter",
 +        "//tensorflow/lite/kernels:kernel_util",
 +        "@FP16",
@@ -14520,10 +14521,10 @@ index 00000000000..ef2dd7c66c3
 \ No newline at end of file
 diff --git a/tensorflow/lite/delegates/webnn/webnn_delegate.cc b/tensorflow/lite/delegates/webnn/webnn_delegate.cc
 new file mode 100644
-index 00000000000..7b2bfe56e82
+index 00000000000..b22d8f5caf4
 --- /dev/null
 +++ b/tensorflow/lite/delegates/webnn/webnn_delegate.cc
-@@ -0,0 +1,3020 @@
+@@ -0,0 +1,3590 @@
 +/* Copyright 2021 The TensorFlow Authors. All Rights Reserved.
 +
 +Licensed under the Apache License, Version 2.0 (the "License");
@@ -14564,6 +14565,7 @@ index 00000000000..7b2bfe56e82
 +#include "tensorflow/lite/c/builtin_op_data.h"
 +#include "tensorflow/lite/c/common.h"
 +#include "tensorflow/lite/minimal_logging.h"
++#include "tensorflow/lite/kernels/internal/tensor_ctypes.h"
 +#include "tensorflow/lite/kernels/internal/utils/sparsity_format_converter.h"
 +#include "tensorflow/lite/kernels/kernel_util.h"
 +
@@ -14695,9 +14697,22 @@ index 00000000000..7b2bfe56e82
 +            tensors[t] = t;
 +          }
 +          break;
++        case kTfLiteBuiltinTranspose:
++          // Ignore the second input (perm), as it is represented as
++          // parameters of the WebNN operator rather than extra input.
++          {
++            const int t = node->inputs->data[0];
++            tensors[t] = t;
++            break;
++          }
 +        default:
 +          // All other operators: process all inputs
 +          for (int k = 0; k < node->inputs->size; k++) {
++            if (registration->builtin_code == kTfLiteBuiltinTransposeConv &&
++                k == 0) {
++              // Ignore the output size parameter (see above).
++              continue;
++            }
 +            const int t = node->inputs->data[k];
 +            if (t >= 0) {
 +              tensors[t] = t;
@@ -14790,8 +14805,6 @@ index 00000000000..7b2bfe56e82
 +    }
 +
 +    // Create WebNN nodes for TFLite delegate nodes
-+    // keep the buffers of constants created during graph building.
-+    std::vector<std::unique_ptr<char>> constant_buffers;
 +    for (int i = 0; i < params->nodes_to_replace->size; i++) {
 +      const int node_index = params->nodes_to_replace->data[i];
 +      if (delegate->static_unpack_nodes_.count(node_index)) {
@@ -14808,8 +14821,7 @@ index 00000000000..7b2bfe56e82
 +      }
 +
 +      if (VisitNode(wnn_builder, context, registration, node, node_index,
-+                    quasi_static_tensors, webnn_operands, constant_buffers,
-+                    false) != kTfLiteOk) {
++                    quasi_static_tensors, webnn_operands, false) != kTfLiteOk) {
 +        return nullptr;
 +      }
 +    }
@@ -14974,7 +14986,7 @@ index 00000000000..7b2bfe56e82
 +    return kTfLiteOk;
 +  }
 +
-+  static TfLiteStatus CheckMediaPipeTransposedConvolutionParams(
++  static TfLiteStatus CheckTransposedConvolutionParams(
 +      TfLiteContext* context, const TfLiteTransposeConvParams* params,
 +      int node_index) {
 +    if (params->stride_width <= 0) {
@@ -15033,6 +15045,32 @@ index 00000000000..7b2bfe56e82
 +    if (params->filter_height <= 0) {
 +      TF_LITE_MAYBE_KERNEL_LOG(context, "invalid filter height %d in node #%d",
 +                               params->filter_height, node_index);
++      return kTfLiteError;
++    }
++
++    if (params->stride_width > params->filter_width) {
++      TF_LITE_MAYBE_KERNEL_LOG(
++          context,
++          "unsupported width stride %d exceeding filter width %d in node #%d",
++          params->stride_width, params->filter_width, node_index);
++      return kTfLiteError;
++    }
++
++    if (params->stride_height > params->filter_height) {
++      TF_LITE_MAYBE_KERNEL_LOG(
++          context,
++          "unsupported height stride %d exceeding filter height %d in node #%d",
++          params->stride_height, params->filter_height, node_index);
++      return kTfLiteError;
++    }
++
++    if (params->filter_width == 1 && params->filter_height == 1 &&
++        std::max(params->stride_width, params->stride_height) > 1) {
++      TF_LITE_MAYBE_KERNEL_LOG(context,
++                               "unsupported pooling with 1x1 filter "
++                               "and %dx%d stride in node #%d",
++                               params->stride_width, params->stride_height,
++                               node_index);
 +      return kTfLiteError;
 +    }
 +
@@ -15181,6 +15219,47 @@ index 00000000000..7b2bfe56e82
 +                            expected_num_dims, tensor_index);
 +  }
 +
++  static TfLiteStatus CheckSlopeTensorShape(TfLiteContext* context,
++                                            const TfLiteTensor& tensor,
++                                            int tensor_index,
++                                            int node_index,
++                                            int input_last_dim) {
++    const auto slope_rank = NumDimensions(&tensor);
++    if (slope_rank < 1) {
++      TF_LITE_MAYBE_KERNEL_LOG(context,
++                               "unexpected number of shape dimensions (%d) in "
++                               "slope tensor #%d in Prelu node #%d: "
++                               "expected at least a 1D tensor",
++                               slope_rank, tensor_index, node_index);
++      return kTfLiteError;
++    }
++    // Validate that all non-channel dimensions (if any) are exactly 1.
++    for (int i = 0; i < slope_rank - 1; i++) {
++      if (SizeOfDimension(&tensor, i) != 1) {
++        TF_LITE_MAYBE_KERNEL_LOG(
++            context,
++            "unexpected value %d of shape dimension #%d in "
++            "slope tensor #%d in Prelu node #%d: "
++            "expected 1 for non-channel dimensions",
++            tensor.dims->data[i], i, tensor_index, node_index);
++        return kTfLiteError;
++      }
++    }
++    // Validate that the input and slope have the same last dimension.
++    if (tensor.dims->data[slope_rank - 1] != input_last_dim) {
++      TF_LITE_MAYBE_KERNEL_LOG(
++          context,
++          "unexpected value %d of last dimension in "
++          "slope tensor #%d in Prelu node #%d: "
++          "expected %d to be same as input's last dimension",
++          tensor.dims->data[slope_rank - 1], tensor_index, node_index,
++          input_last_dim);
++      return kTfLiteError;
++    }
++
++    return kTfLiteOk;
++  }
++
 +  static TfLiteStatus CheckPaddingsTensorShape(TfLiteContext* context,
 +                                               const TfLiteTensor& tensor,
 +                                               int expected_rows,
@@ -15273,6 +15352,24 @@ index 00000000000..7b2bfe56e82
 +    return kTfLiteOk;
 +  }
 +
++  static TfLiteStatus CheckTensorsDimensionMatch(
++      TfLiteContext* context, const TfLiteTensor& input_tensor,
++      const TfLiteTensor& output_tensor, int dimension_index, int node_index,
++      const char* op_name) {
++    if (SizeOfDimension(&input_tensor, dimension_index) !=
++        SizeOfDimension(&output_tensor, dimension_index)) {
++      TF_LITE_MAYBE_KERNEL_LOG(
++          context,
++          "mismatch in shape dimension %d (%d != %d) in input and output "
++          "tensors of %s operator #%d",
++          dimension_index, SizeOfDimension(&input_tensor, dimension_index),
++          SizeOfDimension(&output_tensor, dimension_index), op_name,
++          node_index);
++      return kTfLiteError;
++    }
++    return kTfLiteOk;
++  }
++
 +  // Check if WebNN op is supported on current platform
 +  static TfLiteStatus CheckWebNNOpSupport(
 +      const emscripten::val builder, const std::string op_name) {
@@ -15286,10 +15383,9 @@ index 00000000000..7b2bfe56e82
 +    return kTfLiteOk;
 +  }
 +
-+  static emscripten::val BuildClamp(
-+      const emscripten::val& builder, const emscripten::val& input,
-+      float min_value, float max_value,
-+      std::vector<std::unique_ptr<char>>& constant_buffers) {
++  static emscripten::val BuildClamp(const emscripten::val& builder,
++                                    const emscripten::val& input,
++                                    float min_value, float max_value) {
 +    emscripten::val options = emscripten::val::object();
 +    options.set("minValue", min_value);
 +    options.set("maxValue", max_value);
@@ -15352,8 +15448,7 @@ index 00000000000..7b2bfe56e82
 +  static TfLiteStatus VisitActivation(
 +      const emscripten::val& builder, int input_tensor_id, int output_tensor_id,
 +      TfLiteFusedActivation activation,
-+      std::unordered_map<int, emscripten::val>& webnn_operands,
-+      std::vector<std::unique_ptr<char>>& constant_buffers) {
++      std::unordered_map<int, emscripten::val>& webnn_operands) {
 +    switch (activation) {
 +      case kTfLiteActNone:
 +        return kTfLiteOk;
@@ -15363,13 +15458,11 @@ index 00000000000..7b2bfe56e82
 +        return kTfLiteOk;
 +      case kTfLiteActReluN1To1:
 +        webnn_operands.at(output_tensor_id) = BuildClamp(
-+            builder, webnn_operands.at(input_tensor_id),
-+            -1.0f, +1.0f, constant_buffers);
++            builder, webnn_operands.at(input_tensor_id), -1.0f, +1.0f);
 +        return kTfLiteOk;
 +      case kTfLiteActRelu6:
-+        webnn_operands.at(output_tensor_id) = BuildClamp(
-+            builder, webnn_operands.at(input_tensor_id),
-+            0.0f, 6.0f, constant_buffers);
++        webnn_operands.at(output_tensor_id) =
++            BuildClamp(builder, webnn_operands.at(input_tensor_id), 0.0f, 6.0f);
 +        return kTfLiteOk;
 +      case kTfLiteActTanh:
 +        webnn_operands.at(output_tensor_id) = builder.call<emscripten::val>(
@@ -15389,7 +15482,6 @@ index 00000000000..7b2bfe56e82
 +      TfLiteRegistration* registration, TfLiteNode* node, int node_index,
 +      const std::unordered_set<int>& quasi_static_tensors,
 +      std::unordered_map<int, emscripten::val>& webnn_operands,
-+      std::vector<std::unique_ptr<char>>& constant_buffers,
 +      const bool detect_supported_op) {
 +    // TFLite context used for logging purposes. When we create a new node
 +    // (detect_supported_op is false), logging context is the same as context,
@@ -15398,13 +15490,17 @@ index 00000000000..7b2bfe56e82
 +    // error messages are supressed.
 +    TfLiteContext* logging_context = detect_supported_op ? nullptr : context;
 +    switch (registration->builtin_code) {
++      case kTfLiteBuiltinAbs:
++        return VisitUnaryNode(builder, logging_context, node_index, node,
++                              context->tensors, webnn_operands,
++                              detect_supported_op, "abs");
 +      case kTfLiteBuiltinAdd: {
 +        const TfLiteAddParams* add_params =
 +            static_cast<const TfLiteAddParams*>(node->builtin_data);
 +
 +        return VisitAddNode(builder, logging_context, node_index, node,
 +                            context->tensors, add_params, webnn_operands,
-+                            constant_buffers, detect_supported_op);
++                            detect_supported_op);
 +      }
 +      case kTfLiteBuiltinSub: {
 +        const TfLiteSubParams* sub_params =
@@ -15412,7 +15508,7 @@ index 00000000000..7b2bfe56e82
 +
 +        return VisitSubNode(builder, logging_context, node_index, node,
 +                            context->tensors, sub_params, webnn_operands,
-+                            constant_buffers, detect_supported_op);
++                            detect_supported_op);
 +      }
 +      case kTfLiteBuiltinMul: {
 +        const TfLiteMulParams* mul_params =
@@ -15420,47 +15516,63 @@ index 00000000000..7b2bfe56e82
 +
 +        return VisitMulNode(builder, logging_context, node_index, node,
 +                            context->tensors, mul_params, webnn_operands,
-+                            constant_buffers, detect_supported_op);
++                            detect_supported_op);
 +      }
++      case kTfLiteBuiltinNeg:
++        return VisitUnaryNode(builder, logging_context, node_index, node,
++                              context->tensors, webnn_operands,
++                              detect_supported_op, "neg");
 +      case kTfLiteBuiltinPad:
 +        return VisitPadNode(builder, logging_context, node_index, node,
 +                            context->tensors, webnn_operands,
-+                            constant_buffers, detect_supported_op);
++                            detect_supported_op);
++      case kTfLiteBuiltinPrelu:
++        return VisitPreluNode(builder, logging_context, node_index, node,
++                              context->tensors, webnn_operands,
++                              detect_supported_op);
 +      case kTfLiteBuiltinAveragePool2d: {
 +        const TfLitePoolParams* pool_params =
 +            static_cast<const TfLitePoolParams*>(node->builtin_data);
 +
 +        return VisitAveragePool2DNode(builder, logging_context, node_index,
 +                                      node, context->tensors, pool_params,
-+                                      webnn_operands, constant_buffers,
-+                                      detect_supported_op);
++                                      webnn_operands, detect_supported_op);
 +      }
++      case kTfLiteBuiltinCeil:
++        return VisitUnaryNode(builder, logging_context, node_index, node,
++                              context->tensors, webnn_operands,
++                              detect_supported_op, "ceil");
 +      case kTfLiteBuiltinMaxPool2d: {
 +        const TfLitePoolParams* pool_params =
 +            static_cast<const TfLitePoolParams*>(node->builtin_data);
 +
-+        return VisitMaxPool2DNode(builder, logging_context, node_index,
-+                                  node, context->tensors, pool_params,
-+                                  webnn_operands, constant_buffers,
++        return VisitMaxPool2DNode(builder, logging_context, node_index, node,
++                                  context->tensors, pool_params, webnn_operands,
 +                                  detect_supported_op);
 +      }
++      case kTfLiteBuiltinMaximum:
++        return VisitMaximumNode(builder, logging_context, node_index, node,
++                                context->tensors, webnn_operands,
++                                detect_supported_op);
 +      case kTfLiteBuiltinMean: {
 +        const TfLiteReducerParams* reducer_params =
 +            static_cast<const TfLiteReducerParams*>(node->builtin_data);
 +
-+        return VisitMeanNode(builder, logging_context, node_index,
-+                             node, context->tensors, reducer_params,
-+                             webnn_operands, constant_buffers,
++        return VisitMeanNode(builder, logging_context, node_index, node,
++                             context->tensors, reducer_params, webnn_operands,
 +                             detect_supported_op);
 +      }
++      case kTfLiteBuiltinMinimum:
++        return VisitMinimumNode(builder, logging_context, node_index, node,
++                                context->tensors, webnn_operands,
++                                detect_supported_op);
 +      case kTfLiteBuiltinConcatenation: {
 +        const TfLiteConcatenationParams* concat_params =
 +            static_cast<const TfLiteConcatenationParams*>(node->builtin_data);
 +
 +        return VisitConcatenationNode(builder, logging_context, node_index,
 +                                      node, context->tensors, concat_params,
-+                                      webnn_operands, constant_buffers,
-+                                      detect_supported_op);
++                                      webnn_operands, detect_supported_op);
 +      }
 +      case kTfLiteBuiltinConv2d: {
 +        const TfLiteConvParams* conv_params =
@@ -15469,7 +15581,7 @@ index 00000000000..7b2bfe56e82
 +        return VisitConv2DNode(builder, logging_context, node_index, node,
 +                               context->tensors, conv_params,
 +                               quasi_static_tensors, webnn_operands,
-+                               constant_buffers, detect_supported_op);
++                               detect_supported_op);
 +      }
 +      case kTfLiteBuiltinDepthwiseConv2d: {
 +        const TfLiteDepthwiseConvParams* dwconv_params =
@@ -15478,7 +15590,15 @@ index 00000000000..7b2bfe56e82
 +        return VisitDepthwiseConv2DNode(builder, logging_context, node_index,
 +                                        node, context->tensors, dwconv_params,
 +                                        quasi_static_tensors, webnn_operands,
-+                                        constant_buffers, detect_supported_op);
++                                        detect_supported_op);
++      }
++      case kTfLiteBuiltinDiv: {
++        const TfLiteDivParams* div_params =
++            static_cast<const TfLiteDivParams*>(node->builtin_data);
++
++        return VisitDivNode(builder, logging_context, node_index, node,
++                            context->tensors, div_params, webnn_operands,
++                            detect_supported_op);
 +      }
 +      case kTfLiteBuiltinFullyConnected: {
 +        const TfLiteFullyConnectedParams* fc_params =
@@ -15487,20 +15607,40 @@ index 00000000000..7b2bfe56e82
 +        return VisitFullyConnectedNode(builder, logging_context, node_index,
 +                                       node, context->tensors, fc_params,
 +                                       quasi_static_tensors, webnn_operands,
-+                                       constant_buffers, detect_supported_op);
++                                       detect_supported_op);
 +      }
++      case kTfLiteBuiltinFloor:
++        return VisitUnaryNode(builder, logging_context, node_index, node,
++                              context->tensors, webnn_operands,
++                              detect_supported_op, "floor");
 +      case kTfLiteBuiltinHardSwish:
-+        return VisitHardSwishNode(builder, logging_context, node_index, node,
-+                                  context->tensors, webnn_operands,
-+                                  detect_supported_op);
++        return VisitUnaryNode(builder, logging_context, node_index, node,
++                              context->tensors, webnn_operands,
++                              detect_supported_op, "hardSwish");
++      case kTfLiteBuiltinLeakyRelu: {
++        const TfLiteLeakyReluParams* leaky_relu_params =
++            static_cast<const TfLiteLeakyReluParams*>(node->builtin_data);
++
++        return VisitLeakyReluNode(builder, logging_context, node_index, node,
++                                  context->tensors, leaky_relu_params,
++                                  webnn_operands, detect_supported_op);
++      }
 +      case kTfLiteBuiltinLogistic:
-+        return VisitLogisticNode(builder, logging_context, node_index, node,
-+                                 context->tensors, webnn_operands,
-+                                 detect_supported_op);
++        return VisitUnaryNode(builder, logging_context, node_index, node,
++                              context->tensors, webnn_operands,
++                              detect_supported_op, "sigmoid");
 +      case kTfLiteBuiltinRelu:
-+        return VisitReluNode(builder, logging_context, node_index, node,
-+                             context->tensors, webnn_operands,
-+                             detect_supported_op);
++        return VisitUnaryNode(builder, logging_context, node_index, node,
++                              context->tensors, webnn_operands,
++                              detect_supported_op, "relu");
++      case kTfLiteBuiltinReluN1To1:
++        return VisitClampNode(builder, logging_context, node_index, node,
++                              context->tensors, webnn_operands,
++                              detect_supported_op, -1.0f, +1.0f);
++      case kTfLiteBuiltinRelu6:
++        return VisitClampNode(builder, logging_context, node_index, node,
++                              context->tensors, webnn_operands,
++                              detect_supported_op, 0.0f, 6.0f);
 +      case kTfLiteBuiltinReshape: {
 +        const TfLiteReshapeParams* reshape_params =
 +            static_cast<const TfLiteReshapeParams*>(node->builtin_data);
@@ -15534,9 +15674,22 @@ index 00000000000..7b2bfe56e82
 +                              detect_supported_op);
 +      }
 +      case kTfLiteBuiltinTanh:
-+        return VisitTanhNode(builder, logging_context, node_index, node,
-+                             context->tensors, webnn_operands,
-+                             detect_supported_op);
++        return VisitUnaryNode(builder, logging_context, node_index, node,
++                              context->tensors, webnn_operands,
++                              detect_supported_op, "tanh");
++      case kTfLiteBuiltinTranspose:
++        return VisitTransposeNode(builder, logging_context, node_index, node,
++                                  context->tensors, webnn_operands,
++                                  detect_supported_op);
++      case kTfLiteBuiltinTransposeConv: {
++        const TfLiteTransposeConvParams* deconv_params =
++            static_cast<const TfLiteTransposeConvParams*>(node->builtin_data);
++
++        return VisitTransposeConvNode(builder, logging_context, node_index,
++                                      node, context->tensors, deconv_params,
++                                      quasi_static_tensors, webnn_operands,
++                                      detect_supported_op);
++      }
 +      case kTfLiteBuiltinUnpack: {
 +        const TfLiteUnpackParams* unpack_params =
 +            static_cast<const TfLiteUnpackParams*>(node->builtin_data);
@@ -15553,7 +15706,7 @@ index 00000000000..7b2bfe56e82
 +                      node->custom_initial_data_size);
 +
 +          return VisitMediaPipeDeconvolutionNode(
-+              builder, context, node_index, node, context->tensors,
++              builder, logging_context, node_index, node, context->tensors,
 +              &deconv_params, quasi_static_tensors, webnn_operands,
 +              detect_supported_op);
 +        }
@@ -15569,7 +15722,6 @@ index 00000000000..7b2bfe56e82
 +      int node_index, TfLiteNode* node, const TfLiteTensor* tensors,
 +      const TfLiteAddParams* add_params,
 +      std::unordered_map<int, emscripten::val>& webnn_operands,
-+      std::vector<std::unique_ptr<char>>& constant_buffers,
 +      const bool detect_supported_op) {
 +    TF_LITE_ENSURE_STATUS(
 +        CheckNumInputsAndOutputs(logging_context, node, 2, 1, node_index));
@@ -15611,9 +15763,9 @@ index 00000000000..7b2bfe56e82
 +      TF_LITE_ENSURE(logging_context, webnn_operands.at(output_tensor_id).as<bool>());
 +
 +      if (add_params != nullptr) {
-+        TF_LITE_ENSURE_STATUS(VisitActivation(
-+            builder, output_tensor_id, output_tensor_id, add_params->activation,
-+            webnn_operands, constant_buffers));
++        TF_LITE_ENSURE_STATUS(
++            VisitActivation(builder, output_tensor_id, output_tensor_id,
++                            add_params->activation, webnn_operands));
 +      }
 +    }
 +
@@ -15625,7 +15777,6 @@ index 00000000000..7b2bfe56e82
 +      int node_index, TfLiteNode* node, const TfLiteTensor* tensors,
 +      const TfLiteSubParams* sub_params,
 +      std::unordered_map<int, emscripten::val>& webnn_operands,
-+      std::vector<std::unique_ptr<char>>& constant_buffers,
 +      const bool detect_supported_op) {
 +    TF_LITE_ENSURE_STATUS(
 +        CheckNumInputsAndOutputs(logging_context, node, 2, 1, node_index));
@@ -15667,9 +15818,9 @@ index 00000000000..7b2bfe56e82
 +      TF_LITE_ENSURE(logging_context, webnn_operands.at(output_tensor_id).as<bool>());
 +
 +      if (sub_params != nullptr) {
-+        TF_LITE_ENSURE_STATUS(VisitActivation(
-+            builder, output_tensor_id, output_tensor_id, sub_params->activation,
-+            webnn_operands, constant_buffers));
++        TF_LITE_ENSURE_STATUS(
++            VisitActivation(builder, output_tensor_id, output_tensor_id,
++                            sub_params->activation, webnn_operands));
 +      }
 +    }
 +
@@ -15681,7 +15832,6 @@ index 00000000000..7b2bfe56e82
 +      int node_index, TfLiteNode* node, const TfLiteTensor* tensors,
 +      const TfLiteMulParams* mul_params,
 +      std::unordered_map<int, emscripten::val>& webnn_operands,
-+      std::vector<std::unique_ptr<char>>& constant_buffers,
 +      const bool detect_supported_op) {
 +    TF_LITE_ENSURE_STATUS(
 +        CheckNumInputsAndOutputs(logging_context, node, 2, 1, node_index));
@@ -15722,10 +15872,51 @@ index 00000000000..7b2bfe56e82
 +                                        webnn_operands.at(input2_tensor_id))));
 +      TF_LITE_ENSURE(logging_context, webnn_operands.at(output_tensor_id).as<bool>());
 +      if (mul_params != nullptr) {
-+        TF_LITE_ENSURE_STATUS(VisitActivation(
-+            builder, output_tensor_id, output_tensor_id, mul_params->activation,
-+            webnn_operands, constant_buffers));
++        TF_LITE_ENSURE_STATUS(
++            VisitActivation(builder, output_tensor_id, output_tensor_id,
++                            mul_params->activation, webnn_operands));
 +      }
++    }
++
++    return kTfLiteOk;
++  }
++
++  static TfLiteStatus VisitLeakyReluNode(
++      const emscripten::val& builder, TfLiteContext* logging_context,
++      int node_index, TfLiteNode* node, const TfLiteTensor* tensors,
++      const TfLiteLeakyReluParams* leaky_relu_params,
++      std::unordered_map<int, emscripten::val>& webnn_operands,
++      const bool detect_supported_op) {
++    TF_LITE_ENSURE_STATUS(CheckNumInputsAndOutputs(
++        logging_context, node, 1, 1, node_index));
++
++    const int input_tensor_id = node->inputs->data[0];
++    const TfLiteTensor& input_tensor = tensors[input_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32Type(
++        logging_context, input_tensor, input_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, input_tensor, input_tensor_id, node_index));
++
++    const int output_tensor_id = node->outputs->data[0];
++    const TfLiteTensor& output_tensor = tensors[output_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32Type(
++        logging_context, output_tensor, output_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, output_tensor, output_tensor_id, node_index));
++
++    if (detect_supported_op) {
++      TF_LITE_ENSURE_STATUS(CheckWebNNOpSupport(builder, "leakyRelu"));
++    } else {
++      TF_LITE_ENSURE(logging_context,
++                     webnn_operands.at(input_tensor_id).as<bool>());
++      emscripten::val options = emscripten::val::object();
++      options.set("alpha", leaky_relu_params->alpha);
++      webnn_operands.insert(std::make_pair(
++          output_tensor_id,
++          builder.call<emscripten::val>(
++              "leakyRelu", webnn_operands.at(input_tensor_id), options)));
++      TF_LITE_ENSURE(logging_context,
++                     webnn_operands.at(output_tensor_id).as<bool>());
 +    }
 +
 +    return kTfLiteOk;
@@ -15735,7 +15926,6 @@ index 00000000000..7b2bfe56e82
 +      const emscripten::val& builder, TfLiteContext* logging_context,
 +      int node_index, TfLiteNode* node, const TfLiteTensor* tensors,
 +      std::unordered_map<int, emscripten::val>& webnn_operands,
-+      std::vector<std::unique_ptr<char>>& constant_buffers,
 +      const bool detect_supported_op) {
 +    TF_LITE_ENSURE_STATUS(
 +        CheckNumInputsAndOutputs(logging_context, node, 2, 1, node_index));
@@ -15790,30 +15980,76 @@ index 00000000000..7b2bfe56e82
 +    if (detect_supported_op) {
 +      TF_LITE_ENSURE_STATUS(CheckWebNNOpSupport(builder, "pad"));
 +    } else {
-+      size_t rank = paddings_tensor.dims->data[0];
-+      std::vector<int32_t> padding(rank * 2);
-+      for (int i = 0; i < rank; i++) {
-+        padding[i * 2 + 0] = static_cast<int32_t>(paddings_data[i * 2 + 0]);
-+        padding[i * 2 + 1] = static_cast<int32_t>(paddings_data[i * 2 + 1]);
++      TF_LITE_ENSURE(logging_context,
++                     webnn_operands.at(input_tensor_id).as<bool>());
++      emscripten::val beginning_padding = emscripten::val::array();
++      emscripten::val ending_padding = emscripten::val::array();
++      for (int i = 0; i < paddings_tensor.dims->data[0]; i++) {
++        beginning_padding.call<void>(
++            "push", static_cast<uint32_t>(paddings_data[i * 2 + 0]));
++        ending_padding.call<void>(
++            "push", static_cast<uint32_t>(paddings_data[i * 2 + 1]));
 +      }
-+      const size_t padding_buffer_length = sizeof(int32_t) * padding.size();
-+      std::unique_ptr<char> padding_buffer(new char[padding_buffer_length]);
-+      std::memcpy(padding_buffer.get(), padding.data(), padding_buffer_length);
-+      std::vector<int32_t> dims = {static_cast<int32_t>(rank), 2};
-+      emscripten::val desc = emscripten::val::object();
-+      desc.set("type", emscripten::val("int32"));
-+      desc.set("dimensions", emscripten::val::array(dims));
-+
-+      emscripten::val view{ emscripten::typed_memory_view(padding.size(), padding.data()) };
-+      emscripten::val padding_operand = builder.call<emscripten::val>("constant", desc, view);
-+      constant_buffers.push_back(std::move(padding_buffer));
-+
-+      TF_LITE_ENSURE(logging_context, webnn_operands.at(input_tensor_id).as<bool>());
-+      webnn_operands.insert(std::make_pair(output_tensor_id,
-+          builder.call<emscripten::val>("pad",
-+                                        webnn_operands.at(input_tensor_id),
-+                                        padding_operand)));
++      webnn_operands.insert(std::make_pair(
++          output_tensor_id, builder.call<emscripten::val>(
++                                "pad", webnn_operands.at(input_tensor_id),
++                                beginning_padding, ending_padding)));
 +      TF_LITE_ENSURE(logging_context, webnn_operands.at(output_tensor_id).as<bool>());
++    }
++
++    return kTfLiteOk;
++  }
++
++  static TfLiteStatus VisitPreluNode(
++      const emscripten::val& builder, TfLiteContext* logging_context,
++      int node_index, TfLiteNode* node, const TfLiteTensor* tensors,
++      std::unordered_map<int, emscripten::val>& webnn_operands,
++      const bool detect_supported_op) {
++    TF_LITE_ENSURE_STATUS(
++        CheckNumInputsAndOutputs(logging_context, node, 2, 1, node_index));
++
++    const int input_tensor_id = node->inputs->data[0];
++    const TfLiteTensor& input_tensor = tensors[input_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32Type(logging_context, input_tensor,
++                                                 input_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, input_tensor, input_tensor_id, node_index));
++
++    const int input_last_dim =
++        input_tensor.dims->data[input_tensor.dims->size - 1];
++
++    const int slope_tensor_id = node->inputs->data[1];
++    const TfLiteTensor& slope_tensor = tensors[slope_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32Type(logging_context, slope_tensor,
++                                                 slope_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckSlopeTensorShape(logging_context, slope_tensor,
++                                                slope_tensor_id, node_index,
++                                                input_last_dim));
++
++    TF_LITE_ENSURE_STATUS(CheckTensorStaticAllocation(
++        logging_context, slope_tensor, slope_tensor_id, node_index));
++
++    const int output_tensor_id = node->outputs->data[0];
++    const TfLiteTensor& output_tensor = tensors[output_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32Type(logging_context, output_tensor,
++                                                 output_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, output_tensor, output_tensor_id, node_index));
++
++    if (detect_supported_op) {
++      TF_LITE_ENSURE_STATUS(CheckWebNNOpSupport(builder, "prelu"));
++    } else {
++      TF_LITE_ENSURE(logging_context,
++                     webnn_operands.at(input_tensor_id).as<bool>());
++      TF_LITE_ENSURE(logging_context,
++                     webnn_operands.at(slope_tensor_id).as<bool>());
++
++      webnn_operands.insert(std::make_pair(
++          output_tensor_id, builder.call<emscripten::val>(
++                                "prelu", webnn_operands.at(input_tensor_id),
++                                webnn_operands.at(slope_tensor_id))));
++      TF_LITE_ENSURE(logging_context,
++                     webnn_operands.at(output_tensor_id).as<bool>());
 +    }
 +
 +    return kTfLiteOk;
@@ -15824,7 +16060,6 @@ index 00000000000..7b2bfe56e82
 +      int node_index, TfLiteNode* node, const TfLiteTensor* tensors,
 +      const TfLitePoolParams* pool_params,
 +      std::unordered_map<int, emscripten::val>& webnn_operands,
-+      std::vector<std::unique_ptr<char>>& constant_buffers,
 +      const bool detect_supported_op) {
 +    TF_LITE_ENSURE_STATUS(
 +        CheckNumInputsAndOutputs(logging_context, node, 1, 1, node_index));
@@ -15880,9 +16115,9 @@ index 00000000000..7b2bfe56e82
 +      }
 +      TF_LITE_ENSURE(logging_context, webnn_operands.at(output_tensor_id).as<bool>());
 +
-+      TF_LITE_ENSURE_STATUS(VisitActivation(
-+          builder, output_tensor_id, output_tensor_id, pool_params->activation,
-+          webnn_operands, constant_buffers));
++      TF_LITE_ENSURE_STATUS(
++          VisitActivation(builder, output_tensor_id, output_tensor_id,
++                          pool_params->activation, webnn_operands));
 +    }
 +
 +    return kTfLiteOk;
@@ -15893,7 +16128,6 @@ index 00000000000..7b2bfe56e82
 +      int node_index, TfLiteNode* node, const TfLiteTensor* tensors,
 +      const TfLitePoolParams* pool_params,
 +      std::unordered_map<int, emscripten::val>& webnn_operands,
-+      std::vector<std::unique_ptr<char>>& constant_buffers,
 +      const bool detect_supported_op) {
 +    TF_LITE_ENSURE_STATUS(
 +        CheckNumInputsAndOutputs(logging_context, node, 1, 1, node_index));
@@ -15943,9 +16177,53 @@ index 00000000000..7b2bfe56e82
 +                                        options)));
 +      TF_LITE_ENSURE(logging_context, webnn_operands.at(output_tensor_id).as<bool>());
 +
-+      TF_LITE_ENSURE_STATUS(VisitActivation(
-+          builder, output_tensor_id, output_tensor_id, pool_params->activation,
-+          webnn_operands, constant_buffers));
++      TF_LITE_ENSURE_STATUS(
++          VisitActivation(builder, output_tensor_id, output_tensor_id,
++                          pool_params->activation, webnn_operands));
++    }
++
++    return kTfLiteOk;
++  }
++
++  static TfLiteStatus VisitMaximumNode(
++      const emscripten::val& builder, TfLiteContext* logging_context,
++      int node_index, TfLiteNode* node, const TfLiteTensor* tensors,
++      std::unordered_map<int, emscripten::val>& webnn_operands,
++      const bool detect_supported_op) {
++    TF_LITE_ENSURE_STATUS(
++        CheckNumInputsAndOutputs(logging_context, node, 2, 1, node_index));
++
++    const int input1_tensor_id = node->inputs->data[0];
++    const TfLiteTensor& input1_tensor = tensors[input1_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32OrQInt8Type(
++        logging_context, input1_tensor, input1_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, input1_tensor, input1_tensor_id, node_index));
++
++    const int input2_tensor_id = node->inputs->data[1];
++    const TfLiteTensor& input2_tensor = tensors[input2_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32OrQInt8Type(
++        logging_context, input2_tensor, input2_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, input2_tensor, input2_tensor_id, node_index));
++
++    const int output_tensor_id = node->outputs->data[0];
++    const TfLiteTensor& output_tensor = tensors[output_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32OrQInt8Type(
++        logging_context, output_tensor, output_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, output_tensor, output_tensor_id, node_index));
++
++    if (detect_supported_op) {
++      TF_LITE_ENSURE_STATUS(CheckWebNNOpSupport(builder, "max"));
++    } else {
++      TF_LITE_ENSURE(logging_context, webnn_operands.at(input1_tensor_id).as<bool>());
++      TF_LITE_ENSURE(logging_context, webnn_operands.at(input2_tensor_id).as<bool>());
++      webnn_operands.insert(std::make_pair(output_tensor_id,
++          builder.call<emscripten::val>("max",
++                                        webnn_operands.at(input1_tensor_id),
++                                        webnn_operands.at(input2_tensor_id))));
++      TF_LITE_ENSURE(logging_context, webnn_operands.at(output_tensor_id).as<bool>());
 +    }
 +
 +    return kTfLiteOk;
@@ -15956,7 +16234,6 @@ index 00000000000..7b2bfe56e82
 +      int node_index, TfLiteNode* node, const TfLiteTensor* tensors,
 +      const TfLiteReducerParams* reducer_params,
 +      std::unordered_map<int, emscripten::val>& webnn_operands,
-+      std::vector<std::unique_ptr<char>>& constant_buffers,
 +      const bool detect_supported_op) {
 +    TF_LITE_ENSURE_STATUS(
 +        CheckNumInputsAndOutputs(logging_context, node, 2, 1, node_index));
@@ -16061,32 +16338,120 @@ index 00000000000..7b2bfe56e82
 +    return kTfLiteOk;
 +  }
 +
++  static TfLiteStatus VisitMinimumNode(
++      const emscripten::val& builder, TfLiteContext* logging_context,
++      int node_index, TfLiteNode* node, const TfLiteTensor* tensors,
++      std::unordered_map<int, emscripten::val>& webnn_operands,
++      const bool detect_supported_op) {
++    TF_LITE_ENSURE_STATUS(
++        CheckNumInputsAndOutputs(logging_context, node, 2, 1, node_index));
++
++    const int input1_tensor_id = node->inputs->data[0];
++    const TfLiteTensor& input1_tensor = tensors[input1_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32OrQInt8Type(
++        logging_context, input1_tensor, input1_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, input1_tensor, input1_tensor_id, node_index));
++
++    const int input2_tensor_id = node->inputs->data[1];
++    const TfLiteTensor& input2_tensor = tensors[input2_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32OrQInt8Type(
++        logging_context, input2_tensor, input2_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, input2_tensor, input2_tensor_id, node_index));
++
++    const int output_tensor_id = node->outputs->data[0];
++    const TfLiteTensor& output_tensor = tensors[output_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32OrQInt8Type(
++        logging_context, output_tensor, output_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, output_tensor, output_tensor_id, node_index));
++
++    if (detect_supported_op) {
++      TF_LITE_ENSURE_STATUS(CheckWebNNOpSupport(builder, "min"));
++    } else {
++      TF_LITE_ENSURE(logging_context, webnn_operands.at(input1_tensor_id).as<bool>());
++      TF_LITE_ENSURE(logging_context, webnn_operands.at(input2_tensor_id).as<bool>());
++      webnn_operands.insert(std::make_pair(output_tensor_id,
++          builder.call<emscripten::val>("min",
++                                        webnn_operands.at(input1_tensor_id),
++                                        webnn_operands.at(input2_tensor_id))));
++      TF_LITE_ENSURE(logging_context, webnn_operands.at(output_tensor_id).as<bool>());
++    }
++
++    return kTfLiteOk;
++  }
++
 +  static TfLiteStatus VisitConcatenationNode(
 +      const emscripten::val& builder, TfLiteContext* logging_context,
 +      int node_index, TfLiteNode* node, const TfLiteTensor* tensors,
 +      const TfLiteConcatenationParams* concat_params,
 +      std::unordered_map<int, emscripten::val>& webnn_operands,
-+      std::vector<std::unique_ptr<char>>& constant_buffers,
 +      const bool detect_supported_op) {
-+    size_t input_size = node->inputs->size;
-+    const TfLiteTensor& first_input_tensor = tensors[node->inputs->data[0]];
-+    uint32_t axis = concat_params->axis < 0
-+                     ? first_input_tensor.dims->size + concat_params->axis
-+                     : concat_params->axis;
++    TF_LITE_ENSURE_STATUS(
++        CheckNumInputsAndOutputs(logging_context, node, 1, 4, 1, node_index));
++    const int num_inputs = NumInputs(node);
++
++    const int output_tensor_id = node->outputs->data[0];
++    const TfLiteTensor& output_tensor = tensors[output_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32OrQInt8Type(
++        logging_context, output_tensor, output_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, output_tensor, output_tensor_id, node_index));
++
++    // Check dimensions
++    int axis = concat_params->axis;
++    if (axis < 0) axis += NumDimensions(&output_tensor);
++    int sum_axis = 0;
++
++    for (int i = 0; i < num_inputs; i++) {
++      const TfLiteTensor& input_tensor = tensors[node->inputs->data[i]];
++      TF_LITE_ENSURE_STATUS(CheckTensorFloat32OrQInt8Type(
++          logging_context, input_tensor, node->inputs->data[i], node_index));
++      TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++          logging_context, input_tensor, node->inputs->data[i], node_index));
++
++      TF_LITE_ENSURE_EQ(logging_context, NumDimensions(&input_tensor),
++                        NumDimensions(&output_tensor));
++
++      for (int d = 0; d < NumDimensions(&output_tensor); d++) {
++        // All dimensions must match except the 'axis'.
++        if (d == axis) {
++          continue;
++        }
++        const TfLiteTensor& input_tensor = tensors[node->inputs->data[i]];
++        TF_LITE_ENSURE_STATUS(CheckTensorsDimensionMatch(
++            logging_context, input_tensor, output_tensor, d, node_index,
++            "CONCATENATE"));
++      }
++      sum_axis += SizeOfDimension(&input_tensor, axis);
++    }
++
++    if (SizeOfDimension(&output_tensor, axis) != sum_axis) {
++      TF_LITE_MAYBE_KERNEL_LOG(
++          logging_context,
++          "mismatch in axis dimension %d (%d != %d) in output and input"
++          "tensors of CONCATENATE operator #%d",
++          axis, SizeOfDimension(&output_tensor, axis), sum_axis, node_index);
++      return kTfLiteError;
++    }
 +
 +    if (detect_supported_op) {
 +      TF_LITE_ENSURE_STATUS(CheckWebNNOpSupport(builder, "concat"));
 +    } else {
 +      emscripten::val input_operands = emscripten::val::array();
-+      for (size_t i = 0; i < input_size; ++i) {
-+        TF_LITE_ENSURE(logging_context, webnn_operands.at(node->inputs->data[i]).as<bool>());
-+        input_operands.call<void>("push", webnn_operands.at(node->inputs->data[i]));
++      for (size_t i = 0; i < num_inputs; ++i) {
++        TF_LITE_ENSURE(logging_context,
++                       webnn_operands.at(node->inputs->data[i]).as<bool>());
++        input_operands.call<void>("push",
++                                  webnn_operands.at(node->inputs->data[i]));
 +      }
 +      webnn_operands.insert(
 +          std::make_pair(node->outputs->data[0],
 +                         builder.call<emscripten::val>("concat", input_operands,
-+                                                       emscripten::val(axis))));
-+      TF_LITE_ENSURE(logging_context, webnn_operands.at(node->outputs->data[0]).as<bool>());
++                                                       static_cast<uint32_t>(axis))));
++      TF_LITE_ENSURE(logging_context,
++                     webnn_operands.at(node->outputs->data[0]).as<bool>());
 +    }
 +    return kTfLiteOk;
 +  }
@@ -16097,7 +16462,6 @@ index 00000000000..7b2bfe56e82
 +      const TfLiteConvParams* conv_params,
 +      const std::unordered_set<int>& quasi_static_tensors,
 +      std::unordered_map<int, emscripten::val>& webnn_operands,
-+      std::vector<std::unique_ptr<char>>& constant_buffers,
 +      const bool detect_supported_op) {
 +    TF_LITE_ENSURE_STATUS(
 +        CheckConvolutionParams(logging_context, conv_params, node_index));
@@ -16245,7 +16609,7 @@ index 00000000000..7b2bfe56e82
 +    const int kernel_width = filter_tensor.dims->data[2];
 +    const int input_channels = filter_tensor.dims->data[3];
 +
-+    TF_LITE_ENSURE_STATUS(CheckMediaPipeTransposedConvolutionParams(
++    TF_LITE_ENSURE_STATUS(CheckTransposedConvolutionParams(
 +        logging_context, deconv_params, node_index));
 +
 +    std::string auto_pad;
@@ -16284,7 +16648,6 @@ index 00000000000..7b2bfe56e82
 +      const TfLiteDepthwiseConvParams* dwconv_params,
 +      const std::unordered_set<int>& quasi_static_tensors,
 +      std::unordered_map<int, emscripten::val>& webnn_operands,
-+      std::vector<std::unique_ptr<char>>& constant_buffers,
 +      const bool detect_supported_op) {
 +    TF_LITE_ENSURE_STATUS(
 +        CheckNumInputsAndOutputs(logging_context, node, 3, 1, node_index));
@@ -16379,13 +16742,67 @@ index 00000000000..7b2bfe56e82
 +    return kTfLiteOk;
 +  }
 +
++  static TfLiteStatus VisitDivNode(
++      const emscripten::val& builder, TfLiteContext* logging_context,
++      int node_index, TfLiteNode* node, const TfLiteTensor* tensors,
++      const TfLiteDivParams* div_params,
++      std::unordered_map<int, emscripten::val>& webnn_operands,
++      const bool detect_supported_op) {
++    TF_LITE_ENSURE_STATUS(
++        CheckNumInputsAndOutputs(logging_context, node, 2, 1, node_index));
++
++    const int input1_tensor_id = node->inputs->data[0];
++    const TfLiteTensor& input1_tensor = tensors[input1_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32OrQInt8Type(
++        logging_context, input1_tensor, input1_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, input1_tensor, input1_tensor_id, node_index));
++
++    const int input2_tensor_id = node->inputs->data[1];
++    const TfLiteTensor& input2_tensor = tensors[input2_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32OrQInt8Type(
++        logging_context, input2_tensor, input2_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, input2_tensor, input2_tensor_id, node_index));
++
++    const int output_tensor_id = node->outputs->data[0];
++    const TfLiteTensor& output_tensor = tensors[output_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32OrQInt8Type(
++        logging_context, output_tensor, output_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, output_tensor, output_tensor_id, node_index));
++
++    if (detect_supported_op) {
++      TF_LITE_ENSURE_STATUS(CheckWebNNOpSupport(builder, "div"));
++      if (div_params != nullptr) {
++        TF_LITE_ENSURE_STATUS(
++            CheckActivation(builder, node_index, div_params->activation));
++      }
++    } else {
++      TF_LITE_ENSURE(logging_context, webnn_operands.at(input1_tensor_id).as<bool>());
++      TF_LITE_ENSURE(logging_context, webnn_operands.at(input2_tensor_id).as<bool>());
++      webnn_operands.insert(std::make_pair(output_tensor_id,
++          builder.call<emscripten::val>("div",
++                                        webnn_operands.at(input1_tensor_id),
++                                        webnn_operands.at(input2_tensor_id))));
++      TF_LITE_ENSURE(logging_context, webnn_operands.at(output_tensor_id).as<bool>());
++
++      if (div_params != nullptr) {
++        TF_LITE_ENSURE_STATUS(
++            VisitActivation(builder, output_tensor_id, output_tensor_id,
++                            div_params->activation, webnn_operands));
++      }
++    }
++
++    return kTfLiteOk;
++  }
++
 +  static TfLiteStatus VisitFullyConnectedNode(
 +      const emscripten::val& builder, TfLiteContext* logging_context,
 +      int node_index, TfLiteNode* node, const TfLiteTensor* tensors,
 +      const TfLiteFullyConnectedParams* fc_params,
 +      const std::unordered_set<int>& quasi_static_tensors,
 +      std::unordered_map<int, emscripten::val>& webnn_operands,
-+      std::vector<std::unique_ptr<char>>& constant_buffers,
 +      const bool detect_supported_op) {
 +    TF_LITE_ENSURE_STATUS(
 +        CheckFullyConnectedParams(logging_context, fc_params, node_index));
@@ -16551,111 +16968,47 @@ index 00000000000..7b2bfe56e82
 +      }
 +      TF_LITE_ENSURE(logging_context, webnn_operands.at(output_tensor_id).as<bool>());
 +
-+      TF_LITE_ENSURE_STATUS(VisitActivation(
-+          builder, output_tensor_id, output_tensor_id, fc_params->activation,
-+          webnn_operands, constant_buffers));
++      TF_LITE_ENSURE_STATUS(
++          VisitActivation(builder, output_tensor_id, output_tensor_id,
++                          fc_params->activation, webnn_operands));
 +    }
 +
 +    return kTfLiteOk;
 +  }
 +
-+  static TfLiteStatus VisitHardSwishNode(
++  static TfLiteStatus VisitClampNode(
 +      const emscripten::val& builder, TfLiteContext* logging_context,
 +      int node_index, TfLiteNode* node, const TfLiteTensor* tensors,
 +      std::unordered_map<int, emscripten::val>& webnn_operands,
-+      const bool detect_supported_op) {
++      const bool detect_supported_op, float min_value, float max_value) {
 +    TF_LITE_ENSURE_STATUS(
 +        CheckNumInputsAndOutputs(logging_context, node, 1, 1, node_index));
 +
-+    const TfLiteTensor& input_tensor = tensors[node->inputs->data[0]];
-+    TF_LITE_ENSURE_STATUS(CheckTensorFloat32Type(
-+        logging_context, input_tensor, node->inputs->data[0], node_index));
++    const int input_tensor_id = node->inputs->data[0];
++    const TfLiteTensor& input_tensor = tensors[input_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32OrQInt8Type(
++        logging_context, input_tensor, input_tensor_id, node_index));
 +    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
-+        logging_context, input_tensor, node->inputs->data[0], node_index));
++        logging_context, input_tensor, input_tensor_id, node_index));
 +
-+    const TfLiteTensor& output_tensor = tensors[node->outputs->data[0]];
-+    TF_LITE_ENSURE_STATUS(CheckTensorFloat32Type(
-+        logging_context, output_tensor, node->outputs->data[0], node_index));
++    const int output_tensor_id = node->outputs->data[0];
++    const TfLiteTensor& output_tensor = tensors[output_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32OrQInt8Type(
++        logging_context, output_tensor, output_tensor_id, node_index));
 +    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
-+        logging_context, output_tensor, node->outputs->data[0], node_index));
++        logging_context, output_tensor, output_tensor_id, node_index));
 +
 +    if (detect_supported_op) {
-+      TF_LITE_ENSURE_STATUS(CheckWebNNOpSupport(builder, "hardSwish"));
++      TF_LITE_ENSURE_STATUS(CheckWebNNOpSupport(builder, "clamp"));
 +    } else {
-+      TF_LITE_ENSURE(logging_context, webnn_operands.at(node->inputs->data[0]).as<bool>());
-+      webnn_operands.insert(std::make_pair(
-+          node->outputs->data[0],
-+          builder.call<emscripten::val>(
-+              "hardSwish", webnn_operands.at(node->inputs->data[0]))));
-+      TF_LITE_ENSURE(logging_context, webnn_operands.at(node->outputs->data[0]).as<bool>());
-+    }
-+
-+    return kTfLiteOk;
-+  }
-+
-+  static TfLiteStatus VisitLogisticNode(
-+      const emscripten::val& builder, TfLiteContext* logging_context,
-+      int node_index, TfLiteNode* node, const TfLiteTensor* tensors,
-+      std::unordered_map<int, emscripten::val>& webnn_operands,
-+      const bool detect_supported_op) {
-+    TF_LITE_ENSURE_STATUS(
-+        CheckNumInputsAndOutputs(logging_context, node, 1, 1, node_index));
-+
-+    const TfLiteTensor& input_tensor = tensors[node->inputs->data[0]];
-+    TF_LITE_ENSURE_STATUS(CheckTensorFloat32Type(
-+        logging_context, input_tensor, node->inputs->data[0], node_index));
-+    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
-+        logging_context, input_tensor, node->inputs->data[0], node_index));
-+
-+    const TfLiteTensor& output_tensor = tensors[node->outputs->data[0]];
-+    TF_LITE_ENSURE_STATUS(CheckTensorFloat32Type(
-+        logging_context, output_tensor, node->outputs->data[0], node_index));
-+    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
-+        logging_context, output_tensor, node->outputs->data[0], node_index));
-+
-+    if (detect_supported_op) {
-+      TF_LITE_ENSURE_STATUS(CheckWebNNOpSupport(builder, "sigmoid"));
-+    } else {
-+      TF_LITE_ENSURE(logging_context, webnn_operands.at(node->inputs->data[0]).as<bool>());
-+      webnn_operands.insert(std::make_pair(
-+          node->outputs->data[0],
-+          builder.call<emscripten::val>(
-+              "sigmoid", webnn_operands.at(node->inputs->data[0]))));
-+      TF_LITE_ENSURE(logging_context, webnn_operands.at(node->outputs->data[0]).as<bool>());
-+    }
-+
-+    return kTfLiteOk;
-+  }
-+
-+  static TfLiteStatus VisitReluNode(
-+      const emscripten::val& builder, TfLiteContext* logging_context,
-+      int node_index, TfLiteNode* node, const TfLiteTensor* tensors,
-+      std::unordered_map<int, emscripten::val>& webnn_operands,
-+      const bool detect_supported_op) {
-+    TF_LITE_ENSURE_STATUS(
-+        CheckNumInputsAndOutputs(logging_context, node, 1, 1, node_index));
-+
-+    const TfLiteTensor& input_tensor = tensors[node->inputs->data[0]];
-+    TF_LITE_ENSURE_STATUS(CheckTensorFloat32Type(
-+        logging_context, input_tensor, node->inputs->data[0], node_index));
-+    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
-+        logging_context, input_tensor, node->inputs->data[0], node_index));
-+
-+    const TfLiteTensor& output_tensor = tensors[node->outputs->data[0]];
-+    TF_LITE_ENSURE_STATUS(CheckTensorFloat32Type(
-+        logging_context, output_tensor, node->outputs->data[0], node_index));
-+    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
-+        logging_context, output_tensor, node->outputs->data[0], node_index));
-+
-+    if (detect_supported_op) {
-+      TF_LITE_ENSURE_STATUS(CheckWebNNOpSupport(builder, "relu"));
-+    } else {
-+      TF_LITE_ENSURE(logging_context, webnn_operands.at(node->inputs->data[0]).as<bool>());
-+      webnn_operands.insert(std::make_pair(
-+          node->outputs->data[0],
-+          builder.call<emscripten::val>(
-+              "relu", webnn_operands.at(node->inputs->data[0]))));
-+      TF_LITE_ENSURE(logging_context, webnn_operands.at(node->outputs->data[0]).as<bool>());
++      TF_LITE_ENSURE(logging_context,
++                     webnn_operands.at(input_tensor_id).as<bool>());
++      webnn_operands.insert(
++          std::make_pair(output_tensor_id,
++                         BuildClamp(builder, webnn_operands.at(input_tensor_id),
++                                    min_value, max_value)));
++      TF_LITE_ENSURE(logging_context,
++                     webnn_operands.at(output_tensor_id).as<bool>());
 +    }
 +
 +    return kTfLiteOk;
@@ -16838,15 +17191,36 @@ index 00000000000..7b2bfe56e82
 +    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
 +        logging_context, output_tensor, output_tensor_id, node_index));
 +
++    std::vector<int32_t> input_shape;
++    input_shape.assign(&input_tensor.dims->data[0],
++                       &input_tensor.dims->data[0] + input_tensor.dims->size);
 +    if (detect_supported_op) {
 +      TF_LITE_ENSURE_STATUS(CheckWebNNOpSupport(builder, "softmax"));
 +    } else {
 +      TF_LITE_ENSURE(logging_context,
 +                     webnn_operands.at(input_tensor_id).as<bool>());
-+      webnn_operands.insert(
-+          std::make_pair(output_tensor_id,
-+                         builder.call<emscripten::val>(
-+                             "softmax", webnn_operands.at(input_tensor_id))));
++      emscripten::val output = emscripten::val::object();
++      // WebNN Softmax only support 2d input shape, reshape input to 2d.
++      if (input_shape.size() != 2) {
++        emscripten::val new_shape = emscripten::val::array();
++        // TODO: Remove 'null' support and compute the dimension size in
++        // delegate. https://github.com/webmachinelearning/webnn/issues/388
++        new_shape.call<void>("push", emscripten::val::null());
++        new_shape.call<void>("push", input_shape.back());
++
++        emscripten::val reshape = builder.call<emscripten::val>(
++            "reshape", webnn_operands.at(input_tensor_id), new_shape);
++        emscripten::val softmax =
++            builder.call<emscripten::val>("softmax", reshape);
++        // Reshape the output to the same shape of input.
++        output = builder.call<emscripten::val>(
++            "reshape", softmax, emscripten::val::array(input_shape));
++      } else {
++        output = builder.call<emscripten::val>(
++            "softmax", webnn_operands.at(input_tensor_id));
++      }
++
++      webnn_operands.insert(std::make_pair(output_tensor_id, output));
 +      TF_LITE_ENSURE(logging_context,
 +                     webnn_operands.at(output_tensor_id).as<bool>());
 +    }
@@ -16944,35 +17318,229 @@ index 00000000000..7b2bfe56e82
 +    return kTfLiteOk;
 +  }
 +
-+  static TfLiteStatus VisitTanhNode(
++  static TfLiteStatus VisitUnaryNode(
++      const emscripten::val& builder, TfLiteContext* logging_context,
++      int node_index, TfLiteNode* node, const TfLiteTensor* tensors,
++      std::unordered_map<int, emscripten::val>& webnn_operands,
++      const bool detect_supported_op, const std::string unary_node_name) {
++    TF_LITE_ENSURE_STATUS(
++        CheckNumInputsAndOutputs(logging_context, node, 1, 1, node_index));
++
++    const int input_tensor_id = node->inputs->data[0];
++    const TfLiteTensor& input_tensor = tensors[input_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32OrQInt8Type(
++        logging_context, input_tensor, input_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, input_tensor, input_tensor_id, node_index));
++
++    const int output_tensor_id = node->outputs->data[0];
++    const TfLiteTensor& output_tensor = tensors[output_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32OrQInt8Type(
++        logging_context, output_tensor, output_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, output_tensor, output_tensor_id, node_index));
++
++    if (detect_supported_op) {
++      TF_LITE_ENSURE_STATUS(CheckWebNNOpSupport(builder, unary_node_name));
++    } else {
++      TF_LITE_ENSURE(logging_context, webnn_operands.at(input_tensor_id).as<bool>());
++      webnn_operands.insert(std::make_pair(output_tensor_id,
++          builder.call<emscripten::val>(unary_node_name.c_str(),
++                                        webnn_operands.at(input_tensor_id))));
++      TF_LITE_ENSURE(logging_context, webnn_operands.at(output_tensor_id).as<bool>());
++    }
++
++    return kTfLiteOk;
++  }
++
++  static TfLiteStatus VisitTransposeNode(
 +      const emscripten::val& builder, TfLiteContext* logging_context,
 +      int node_index, TfLiteNode* node, const TfLiteTensor* tensors,
 +      std::unordered_map<int, emscripten::val>& webnn_operands,
 +      const bool detect_supported_op) {
 +    TF_LITE_ENSURE_STATUS(
-+        CheckNumInputsAndOutputs(logging_context, node, 1, 1, node_index));
++        CheckNumInputsAndOutputs(logging_context, node, 2, 1, node_index));
 +
-+    const TfLiteTensor& input_tensor = tensors[node->inputs->data[0]];
-+    TF_LITE_ENSURE_STATUS(CheckTensorFloat32Type(
-+        logging_context, input_tensor, node->inputs->data[0], node_index));
++    const int input_tensor_id = node->inputs->data[0];
++    const TfLiteTensor& input_tensor = tensors[input_tensor_id];
 +    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
-+        logging_context, input_tensor, node->inputs->data[0], node_index));
++        logging_context, input_tensor, input_tensor_id, node_index));
 +
-+    const TfLiteTensor& output_tensor = tensors[node->outputs->data[0]];
-+    TF_LITE_ENSURE_STATUS(CheckTensorFloat32Type(
-+        logging_context, output_tensor, node->outputs->data[0], node_index));
++    const TfLiteTensor& perm_tensor = tensors[node->inputs->data[1]];
++    TF_LITE_ENSURE_STATUS(CheckTensorStaticAllocation(
++        logging_context, perm_tensor, node->inputs->data[1], node_index));
++
++    const int32_t* perm_data =
++        reinterpret_cast<const int32_t*>(perm_tensor.data.data);
++    const int dims_count = NumDimensions(&input_tensor);
++    std::vector<uint32_t> perm;
++    for (int i = 0; i < dims_count; i++) {
++      if (perm_data[i] < 0) {
++        TF_LITE_MAYBE_KERNEL_LOG(logging_context, "invalid perm data %d in node %d",
++                                 perm_data[i], node_index);
++        return kTfLiteError;
++      }
++      perm.push_back(static_cast<uint32_t>(perm_data[i]));
++    }
++
++    const int output_tensor_id = node->outputs->data[0];
++    const TfLiteTensor& output_tensor = tensors[output_tensor_id];
 +    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
-+        logging_context, output_tensor, node->outputs->data[0], node_index));
++        logging_context, output_tensor, output_tensor_id, node_index));
 +
 +    if (detect_supported_op) {
-+      TF_LITE_ENSURE_STATUS(CheckWebNNOpSupport(builder, "tanh"));
++      TF_LITE_ENSURE_STATUS(CheckWebNNOpSupport(builder, "transpose"));
 +    } else {
-+      TF_LITE_ENSURE(logging_context, webnn_operands.at(node->inputs->data[0]).as<bool>());
++      TF_LITE_ENSURE(logging_context,
++                     webnn_operands.at(input_tensor_id).as<bool>());
++      emscripten::val options = emscripten::val::object();
++      options.set("permutation", emscripten::val::array(perm));
 +      webnn_operands.insert(std::make_pair(
-+          node->outputs->data[0],
++          output_tensor_id,
 +          builder.call<emscripten::val>(
-+              "tanh", webnn_operands.at(node->inputs->data[0]))));
-+      TF_LITE_ENSURE(logging_context, webnn_operands.at(node->outputs->data[0]).as<bool>());
++              "transpose", webnn_operands.at(input_tensor_id), options)));
++      TF_LITE_ENSURE(logging_context,
++                     webnn_operands.at(output_tensor_id).as<bool>());
++    }
++
++    return kTfLiteOk;
++  }
++
++  static TfLiteStatus VisitTransposeConvNode(
++      const emscripten::val& builder, TfLiteContext* logging_context,
++      int node_index, TfLiteNode* node, const TfLiteTensor* tensors,
++      const TfLiteTransposeConvParams* deconv_params,
++      const std::unordered_set<int>& quasi_static_tensors,
++      std::unordered_map<int, emscripten::val>& webnn_operands,
++      const bool detect_supported_op) {
++    TF_LITE_ENSURE_STATUS(
++        CheckNumInputsAndOutputs(logging_context, node,
++                                 /*min_num_inputs=*/3, /*max_num_inputs=*/4,
++                                 /*expected_num_outputs=*/1, node_index));
++    const bool use_bias = node->inputs->size >= 4;
++
++    const int output_shape_tensor_id = node->inputs->data[0];
++    const TfLiteTensor& output_shape_tensor = tensors[output_shape_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorType(logging_context, output_shape_tensor,
++                                          kTfLiteInt32, output_shape_tensor_id,
++                                          node_index));
++    TF_LITE_ENSURE_STATUS(
++        CheckShapeTensorShape(logging_context, output_shape_tensor,
++                              output_shape_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(
++        CheckTensorStaticAllocation(logging_context, output_shape_tensor,
++                                    output_shape_tensor_id, node_index));
++    const int output_shape_dims = SizeOfDimension(&output_shape_tensor, 0);
++    if (output_shape_dims != 4) {
++      TF_LITE_MAYBE_KERNEL_LOG(
++          logging_context,
++          "unsupported number of output shape dimensions (%d) in node #%d: "
++          "4 dimensions expected",
++          output_shape_dims, node_index);
++      return kTfLiteError;
++    }
++
++    const int filter_tensor_id = node->inputs->data[1];
++    const TfLiteTensor& filter_tensor = tensors[filter_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32Type(
++        logging_context, filter_tensor, filter_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(
++        CheckTensorShape(logging_context, filter_tensor, 4, filter_tensor_id));
++    if (quasi_static_tensors.count(filter_tensor_id) == 0) {
++      TF_LITE_ENSURE_STATUS(CheckTensorStaticAllocation(
++          logging_context, filter_tensor, filter_tensor_id, node_index));
++    }
++
++    const int input_tensor_id = node->inputs->data[2];
++    const TfLiteTensor& input_tensor = tensors[input_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32Type(
++        logging_context, input_tensor, input_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(
++        CheckTensorShape(logging_context, input_tensor, 4, input_tensor_id));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, input_tensor, input_tensor_id, node_index));
++
++    if (use_bias) {
++      const int bias_tensor_id = node->inputs->data[3];
++      if (bias_tensor_id != kTfLiteOptionalTensor) {
++        const TfLiteTensor& bias_tensor = tensors[bias_tensor_id];
++        TF_LITE_ENSURE_STATUS(CheckTensorFloat32Type(
++            logging_context, bias_tensor, bias_tensor_id, node_index));
++        TF_LITE_ENSURE_STATUS(
++            CheckTensorShape(logging_context, bias_tensor, 1, bias_tensor_id));
++        if (quasi_static_tensors.count(bias_tensor_id) == 0) {
++          TF_LITE_ENSURE_STATUS(CheckTensorStaticAllocation(
++              logging_context, bias_tensor, bias_tensor_id, node_index));
++        }
++      }
++    }
++
++    const int output_tensor_id = node->outputs->data[0];
++    const TfLiteTensor& output_tensor = tensors[output_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32Type(
++        logging_context, output_tensor, output_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(
++        CheckTensorShape(logging_context, output_tensor, 4, output_tensor_id));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, output_tensor, output_tensor_id, node_index));
++
++    const int* input_tensor_dims = input_tensor.dims->data;
++    const int* filter_tensor_dims = filter_tensor.dims->data;
++    const int output_channels = filter_tensor_dims[0];
++    const int input_channels = filter_tensor_dims[3];
++
++    const int32_t* output_shape = GetTensorData<int32_t>(&output_shape_tensor);
++    if (output_channels != output_shape[3]) {
++      TF_LITE_MAYBE_KERNEL_LOG(
++          logging_context,
++          "transpose convolution kernel output channel dimension (%d) "
++          "doesn't match output shape channel dimension (%d) in node #%d: "
++          "4 dimensions expected",
++          output_channels, output_shape[3], node_index);
++    }
++    if (input_channels != input_tensor_dims[3]) {
++      TF_LITE_MAYBE_KERNEL_LOG(
++          logging_context,
++          "transpose convolution kernel input channel dimension (%d) "
++          "doesn't match filter input channel (%d) in node #%d",
++          input_channels, input_tensor_dims[3]);
++      return kTfLiteError;
++    }
++
++    TF_LITE_ENSURE_STATUS(CheckTransposedConvolutionParams(
++        logging_context, deconv_params, node_index));
++
++    std::string auto_pad;
++    TF_LITE_ENSURE_STATUS(CalculatePadding(
++        logging_context, deconv_params->padding, auto_pad, node_index));
++
++    if (detect_supported_op) {
++      TF_LITE_ENSURE_STATUS(CheckWebNNOpSupport(builder, "convTranspose2d"));
++    } else {
++      emscripten::val options = emscripten::val::object();
++      options.set("autoPad", emscripten::val(auto_pad));
++      std::vector<int32_t> strides = {deconv_params->stride_height,
++                                      deconv_params->stride_width};
++      options.set("strides", emscripten::val::array(strides));
++      options.set("inputLayout", emscripten::val("nhwc"));
++      options.set("filterLayout", emscripten::val("ohwi"));
++      std::vector<int32_t> output_sizes = {output_shape[1], output_shape[2]};
++      options.set("outputSizes", emscripten::val::array(output_sizes));
++      TF_LITE_ENSURE(logging_context,
++                     webnn_operands.at(input_tensor_id).as<bool>());
++      TF_LITE_ENSURE(logging_context,
++                     webnn_operands.at(filter_tensor_id).as<bool>());
++      if (use_bias) {
++        TF_LITE_ENSURE(logging_context,
++                       webnn_operands.at(node->inputs->data[3]).as<bool>());
++        options.set("bias", webnn_operands.at(node->inputs->data[3]));
++      }
++      emscripten::val output = builder.call<emscripten::val>(
++          "convTranspose2d", webnn_operands.at(input_tensor_id),
++          webnn_operands.at(filter_tensor_id), options);
++      webnn_operands.insert(std::make_pair(output_tensor_id, output));
++      TF_LITE_ENSURE(logging_context,
++                     webnn_operands.at(output_tensor_id).as<bool>());
 +    }
 +
 +    return kTfLiteOk;
@@ -17203,11 +17771,9 @@ index 00000000000..7b2bfe56e82
 +      return nullptr;
 +    }
 +    std::unordered_map<int, emscripten::val> empty_webnn_operands;
-+    std::vector<std::unique_ptr<char>> empty_buffers;
 +    if (Subgraph::VisitNode(wnn_builder, context, registration, node,
 +                            node_index, quasi_static_tensors,
-+                            empty_webnn_operands, empty_buffers,
-+                            true) != kTfLiteOk) {
++                            empty_webnn_operands, true) != kTfLiteOk) {
 +      // If a non-delegated node consumes output of a node that unpacks static
 +      // data, that node shouldn't be delegated.
 +      for (int j = 0; j < node->inputs->size; j++) {
@@ -17429,6 +17995,11 @@ index 00000000000..7b2bfe56e82
 +            &nodes_to_delegate->data[0]);
 +#endif
 +
++  TFLITE_LOG_PROD_ONCE(tflite::TFLITE_LOG_INFO,
++                       "TensorFlow Lite WebNN delegate capability:"
++                       " number of nodes in the graph: %d,"
++                       " number of nodes supported by WebNN: %d.",
++                       execution_plan->size, nodes_to_delegate->size);
 +  return nodes_to_delegate;
 +}
 +
