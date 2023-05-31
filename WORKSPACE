@@ -555,13 +555,6 @@ arm_linux_toolchain_configure(
 )
 
 # Emscripten toolchain
-#http_archive(
-#    name = "emsdk",
-#    sha256 = "7a58a9996b113d3e0675df30b5f17e28aa47de2e684a844f05394fe2f6f12e8e",
-#    strip_prefix = "emsdk-c1589b55641787d55d53e883852035beea9aec3f/bazel",
-#    url = "https://github.com/emscripten-core/emsdk/archive/c1589b55641787d55d53e883852035beea9aec3f.tar.gz",
-#)
-
 http_archive(
     name = "emsdk",
 #    repo_mapping = {"@nodejs": "@nodejs_host"},
@@ -570,25 +563,6 @@ http_archive(
     urls = ["https://github.com/emscripten-core/emsdk/archive/refs/tags/3.1.24.tar.gz"],
 )
 
-# emscripten_url = "https://storage.googleapis.com/webassembly/emscripten-releases-builds/{}/{}/wasm-binaries.tbz2"
-#
-# # "3.1.4"
-# http_archive(
-#     name = "emscripten_bin_linux",
-#     strip_prefix = "install",
-#     url = emscripten_url.format("linux", "39e60dda6945cfcd6487725bdb1361ae7975173f"),
-#     sha256 = "4a57c0d60eeb4e021de61c8497f0b595a0a9db0235f1640a528de752409f4fcf",
-#     build_file = "@emsdk//emscripten_toolchain:emscripten.BUILD",
-#     type = "tar.bz2",
-#     patches = [
-#         # WebNN support
-#         "@//third_party:emscripten_webnn_support.patch",
-#     ],
-#     patch_args = ["-d", "emscripten", "-p1"],
-#     # Clear the cache to renegerate the webnn headers and libs
-#     # The first "yarn build" would fail. Rerunning it would be successful.
-#     patch_cmds = ["rm -r emscripten/cache"],
-# )
 
 load("@emsdk//:deps.bzl", emsdk_deps = "deps")
 

@@ -41,8 +41,6 @@ using bazel and emsdk.
    - Run `yarn run electron-packager` to build an electron.js app of this demo.
 5. The WebNN delegate support
    - `tensorflow_lite_webnn_delegate.patch`: the WebNN delegate implementation.
-   - `emscripten_webnn_support.patch`: WebNN support of emscripten.
-   - `emsdk.patch`: workaround the frozen cache setting of emscripten so WebNN support can be regenerated. As the cache is cleared, the first `yarn build` would fail. Please rerun, it would succeed.
    - Add `TFLiteWebModelRunnerOptions.enableWebNNDelegate` to enable or disable WebNN delegate.
    - Demo in browser is using webnn-polyfill.
    - Demo in electron.js could use [WebNN-native node.js binding](https://github.com/webmachinelearning/webnn-native/tree/main/node) for more details.
