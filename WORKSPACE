@@ -568,11 +568,6 @@ http_archive(
     sha256 = "1aa5365ccb2147701cc9d1e59a5a49577c1d6aea55da7c450df2d5ffa48b8a58",
     strip_prefix = "emsdk-3.1.24/bazel",
     urls = ["https://github.com/emscripten-core/emsdk/archive/refs/tags/3.1.24.tar.gz"],
-    patches = [
-        # WebNN support
-        "@//third_party:emsdk.patch",
-    ],
-    patch_args = ["-p2"],
 )
 
 # emscripten_url = "https://storage.googleapis.com/webassembly/emscripten-releases-builds/{}/{}/wasm-binaries.tbz2"
