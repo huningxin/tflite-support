@@ -60,117 +60,16 @@ index 40f9485b5d6..18421043b2c 100644
    ${TFLITE_EXPERIMENTAL_RUY_PROFILER_SRCS}
    ${TFLITE_EXPERIMENTAL_RUY_SRCS}
 diff --git a/tensorflow/lite/delegates/external/BUILD b/tensorflow/lite/delegates/external/BUILD
-index 192091141be..a914f68c672 100644
+index eba4102a42d..a914f68c672 100644
 --- a/tensorflow/lite/delegates/external/BUILD
 +++ b/tensorflow/lite/delegates/external/BUILD
-@@ -13,6 +13,11 @@
- # limitations under the License.
- # ==============================================================================
+@@ -63,4 +63,4 @@ tflite_cc_shared_object(
  
-+load(
-+    "//tensorflow/lite:build_def.bzl",
-+    "tflite_cc_shared_object",
-+)
-+
- package(
-     default_visibility = [
-         "//visibility:public",
-@@ -31,6 +36,31 @@ cc_library(
-     ],
- )
- 
-+tflite_cc_shared_object(
-+    name = "external_delegate_obj",
-+    linkopts = select({
-+        "//tensorflow:ios": [
-+            "-Wl,-exported_symbols_list,$(location //tensorflow/lite/c:exported_symbols.lds)",
-+        ],
-+        "//tensorflow:macos": [
-+            "-Wl,-exported_symbols_list,$(location //tensorflow/lite/c:exported_symbols.lds)",
-+        ],
-+        "//tensorflow:windows": [
-+            "-Wl,-exported_symbols_list,$(location //tensorflow/lite/c:exported_symbols.lds)",
-+        ],
-+        "//conditions:default": [
-+            "-z defs",
-+            "-Wl,--version-script,$(location //tensorflow/lite/c:version_script.lds)",
-+        ],
-+    }),
-+    per_os_targets = True,
-+    deps = [
-+        ":external_delegate",
-+        "//tensorflow/lite/c:exported_symbols.lds",
-+        "//tensorflow/lite/c:version_script.lds",
-+    ],
-+)
-+
  exports_files([
      "external_delegate.h",
 -])
 +])
 \ No newline at end of file
-diff --git a/tensorflow/lite/delegates/external/external_delegate.cc b/tensorflow/lite/delegates/external/external_delegate.cc
-index 7fe5c5329dd..8fef8920cbd 100644
---- a/tensorflow/lite/delegates/external/external_delegate.cc
-+++ b/tensorflow/lite/delegates/external/external_delegate.cc
-@@ -154,14 +154,12 @@ ExternalDelegateWrapper::ExternalDelegateWrapper(
-     external_delegate_ = external_lib_.create(ckeys.data(), cvalues.data(),
-                                               ckeys.size(), nullptr);
-     if (external_delegate_) {
--      wrapper_delegate_ = {
--          .data_ = reinterpret_cast<void*>(this),
--          .Prepare = DelegatePrepare,
--          .CopyFromBufferHandle = nullptr,
--          .CopyToBufferHandle = nullptr,
--          .FreeBufferHandle = nullptr,
--          .flags = external_delegate_->flags,
--      };
-+      wrapper_delegate_.data_ = reinterpret_cast<void*>(this);
-+      wrapper_delegate_.Prepare = DelegatePrepare;
-+      wrapper_delegate_.CopyFromBufferHandle = nullptr;
-+      wrapper_delegate_.CopyToBufferHandle = nullptr;
-+      wrapper_delegate_.FreeBufferHandle = nullptr;
-+      wrapper_delegate_.flags = external_delegate_->flags;
-       if (external_delegate_->CopyFromBufferHandle) {
-         wrapper_delegate_.CopyFromBufferHandle = DelegateCopyFromBufferHandle;
-       }
-diff --git a/tensorflow/lite/delegates/external/external_delegate.h b/tensorflow/lite/delegates/external/external_delegate.h
-index 9121bd661b4..e15533d2664 100644
---- a/tensorflow/lite/delegates/external/external_delegate.h
-+++ b/tensorflow/lite/delegates/external/external_delegate.h
-@@ -17,6 +17,7 @@ limitations under the License.
- #define TENSORFLOW_LITE_DELEGATES_EXTERNAL_EXTERNAL_DELEGATE_H_
- 
- #include "tensorflow/lite/c/common.h"
-+#include "tensorflow/lite/c/c_api_types.h"  // IWYU pragma: export
- 
- #ifdef __cplusplus
- extern "C" {
-@@ -35,20 +36,20 @@ typedef struct TfLiteExternalDelegateOptions {
- } TfLiteExternalDelegateOptions;
- 
- // Insert key/value to the options.
--TfLiteStatus TfLiteExternalDelegateOptionsInsert(
-+TFL_CAPI_EXPORT TfLiteStatus TfLiteExternalDelegateOptionsInsert(
-     TfLiteExternalDelegateOptions* options, const char* key, const char* value);
- 
- // Populates TfLiteExternalDelegateOptions with the given shared library path.
--TfLiteExternalDelegateOptions TfLiteExternalDelegateOptionsDefault(
-+TFL_CAPI_EXPORT TfLiteExternalDelegateOptions TfLiteExternalDelegateOptionsDefault(
-     const char* lib_path);
- 
- // Creates a new delegate instance that need to be destroyed with
- // `TfLiteExternalDelegateDelete` when delegate is no longer used by TFLite.
--TfLiteDelegate* TfLiteExternalDelegateCreate(
-+TFL_CAPI_EXPORT TfLiteDelegate* TfLiteExternalDelegateCreate(
-     const TfLiteExternalDelegateOptions* options);
- 
- // Destroys a delegate created with `TfLiteExternalDelegateCreate` call.
--void TfLiteExternalDelegateDelete(TfLiteDelegate* delegate);
-+TFL_CAPI_EXPORT void TfLiteExternalDelegateDelete(TfLiteDelegate* delegate);
- 
- #ifdef __cplusplus
- }
 diff --git a/tensorflow/lite/delegates/webnn/BUILD b/tensorflow/lite/delegates/webnn/BUILD
 new file mode 100644
 index 00000000000..b6f3dcf8b7e
@@ -14544,6 +14443,7 @@ index 00000000000..b22d8f5caf4
 +
 +#include <algorithm>
 +#include <array>
++#include <cinttypes>
 +#include <cstdint>
 +#include <cstring>
 +#include <limits>
@@ -14572,6 +14472,17 @@ index 00000000000..b22d8f5caf4
 +namespace tflite {
 +namespace webnn {
 +namespace {
++
++void CopyTensorDataInt32OrInt64(int64_t* dst, const TfLiteTensor& tensor,
++                                size_t n) {
++  if (tensor.type == kTfLiteInt32) {
++    const int32_t* data = GetTensorData<int32_t>(&tensor);
++    std::copy(data, data + n, dst);
++  } else if (tensor.type == kTfLiteInt64) {
++    const int64_t* data = GetTensorData<int64_t>(&tensor);
++    std::copy(data, data + n, dst);
++  }
++}
 +
 +// Forward declaration.
 +TfLiteStatus DelegatePrepare(TfLiteContext* context, TfLiteDelegate* delegate);
@@ -14680,9 +14591,11 @@ index 00000000000..b22d8f5caf4
 +        case kTfLiteBuiltinPad:
 +        case kTfLiteBuiltinReshape:
 +        case kTfLiteBuiltinResizeBilinear:
-+          // Ignore the second input (new shape),
-+          // because it is represented as parameters of the WebNN operator
-+          // rather than extra input.
++        case kTfLiteBuiltinStridedSlice:
++        case kTfLiteBuiltinSlice:
++          // Ignore all but the first input (axes, static padding, new shape,
++          // begins/offsets, sizes), because other inputs are represented as
++          // parameters of the WebNN operator rather than extra input.
 +          {
 +            const int t = node->inputs->data[0];
 +            tensors[t] = t;
@@ -15168,6 +15081,36 @@ index 00000000000..b22d8f5caf4
 +    return kTfLiteOk;
 +  }
 +
++  static TfLiteStatus CheckTensorInt32Type(TfLiteContext* context,
++                                           const TfLiteTensor& tensor,
++                                           int tensor_index, int node_index) {
++    switch (tensor.type) {
++      case kTfLiteInt32:
++        return kTfLiteOk;
++      default:
++        TF_LITE_MAYBE_KERNEL_LOG(
++            context, "unsupported type %s in tensor #%d in node #%d",
++            TfLiteTypeGetName(tensor.type), tensor_index, node_index);
++    }
++    return kTfLiteError;
++  }
++
++  static TfLiteStatus CheckTensorInt32OrInt64Type(TfLiteContext* context,
++                                                  const TfLiteTensor& tensor,
++                                                  int tensor_index,
++                                                  int node_index) {
++    switch (tensor.type) {
++      case kTfLiteInt32:
++      case kTfLiteInt64:
++        return kTfLiteOk;
++      default:
++        TF_LITE_MAYBE_KERNEL_LOG(
++            context, "unsupported type %s in tensor #%d in node #%d",
++            TfLiteTypeGetName(tensor.type), tensor_index, node_index);
++    }
++    return kTfLiteError;
++  }
++
 +  static TfLiteStatus CheckTensorShape(TfLiteContext* context,
 +                                       const TfLiteTensor& tensor,
 +                                       int min_num_dims, int max_num_dims,
@@ -15600,6 +15543,10 @@ index 00000000000..b22d8f5caf4
 +                            context->tensors, div_params, webnn_operands,
 +                            detect_supported_op);
 +      }
++      case kTfLiteBuiltinElu:
++        return VisitEluNode(builder, logging_context, node_index, node,
++                            context->tensors, webnn_operands,
++                            detect_supported_op);
 +      case kTfLiteBuiltinFullyConnected: {
 +        const TfLiteFullyConnectedParams* fc_params =
 +            static_cast<const TfLiteFullyConnectedParams*>(node->builtin_data);
@@ -15657,6 +15604,10 @@ index 00000000000..b22d8f5caf4
 +                                       node, context->tensors, resize_params,
 +                                       webnn_operands, detect_supported_op);
 +      }
++      case kTfLiteBuiltinSlice:
++        return VisitSliceNode(builder, logging_context, node_index, node,
++                              context->tensors, webnn_operands,
++                              detect_supported_op);
 +      case kTfLiteBuiltinSoftmax: {
 +        const TfLiteSoftmaxParams* softmax_params =
 +            static_cast<const TfLiteSoftmaxParams*>(node->builtin_data);
@@ -15672,6 +15623,13 @@ index 00000000000..b22d8f5caf4
 +        return VisitSplitNode(builder, logging_context, node_index, node,
 +                              context->tensors, split_params, webnn_operands,
 +                              detect_supported_op);
++      }
++      case kTfLiteBuiltinStridedSlice: {
++        const auto* params =
++            static_cast<const TfLiteStridedSliceParams*>(node->builtin_data);
++        return VisitStridedSliceNode(builder, logging_context, node_index, node,
++                                     context->tensors, params, webnn_operands,
++                                     detect_supported_op);
 +      }
 +      case kTfLiteBuiltinTanh:
 +        return VisitUnaryNode(builder, logging_context, node_index, node,
@@ -16229,6 +16187,50 @@ index 00000000000..b22d8f5caf4
 +    return kTfLiteOk;
 +  }
 +
++  static TfLiteStatus VisitMaximumNode(
++      const emscripten::val& builder, TfLiteContext* logging_context,
++      int node_index, TfLiteNode* node, const TfLiteTensor* tensors,
++      std::unordered_map<int, emscripten::val>& webnn_operands,
++      const bool detect_supported_op) {
++    TF_LITE_ENSURE_STATUS(
++        CheckNumInputsAndOutputs(logging_context, node, 2, 1, node_index));
++
++    const int input1_tensor_id = node->inputs->data[0];
++    const TfLiteTensor& input1_tensor = tensors[input1_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32OrQInt8Type(
++        logging_context, input1_tensor, input1_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, input1_tensor, input1_tensor_id, node_index));
++
++    const int input2_tensor_id = node->inputs->data[1];
++    const TfLiteTensor& input2_tensor = tensors[input2_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32OrQInt8Type(
++        logging_context, input2_tensor, input2_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, input2_tensor, input2_tensor_id, node_index));
++
++    const int output_tensor_id = node->outputs->data[0];
++    const TfLiteTensor& output_tensor = tensors[output_tensor_id];
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32OrQInt8Type(
++        logging_context, output_tensor, output_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, output_tensor, output_tensor_id, node_index));
++
++    if (detect_supported_op) {
++      TF_LITE_ENSURE_STATUS(CheckWebNNOpSupport(builder, "max"));
++    } else {
++      TF_LITE_ENSURE(logging_context, webnn_operands.at(input1_tensor_id).as<bool>());
++      TF_LITE_ENSURE(logging_context, webnn_operands.at(input2_tensor_id).as<bool>());
++      webnn_operands.insert(std::make_pair(output_tensor_id,
++          builder.call<emscripten::val>("max",
++                                        webnn_operands.at(input1_tensor_id),
++                                        webnn_operands.at(input2_tensor_id))));
++      TF_LITE_ENSURE(logging_context, webnn_operands.at(output_tensor_id).as<bool>());
++    }
++
++    return kTfLiteOk;
++  }
++
 +  static TfLiteStatus VisitMeanNode(
 +      const emscripten::val& builder, TfLiteContext* logging_context,
 +      int node_index, TfLiteNode* node, const TfLiteTensor* tensors,
@@ -16718,8 +16720,16 @@ index 00000000000..b22d8f5caf4
 +      options.set("strides", emscripten::val::array(strides));
 +      options.set("dilations", emscripten::val::array(dilations));
 +      options.set("inputLayout", emscripten::val("nhwc"));
-+      options.set("filterLayout", emscripten::val("ihwo"));
-+      options.set("groups", emscripten::val(output_channels / dwconv_params->depth_multiplier));
++      const auto groups = output_channels / dwconv_params->depth_multiplier;
++      options.set("groups", groups);
++      if (groups != 1) {
++        options.set("filterLayout", emscripten::val("ihwo"));
++      } else {
++        // groups == 1 is a normal conv2d in WebNN.
++        // TODO: Consider depth_multipiler != 1 once the spec issue:
++        // https://github.com/webmachinelearning/webnn/issues/353 fixed.
++        options.set("filterLayout", emscripten::val("ohwi"));
++      }
 +      TF_LITE_ENSURE(logging_context, webnn_operands.at(input_tensor_id).as<bool>());
 +      TF_LITE_ENSURE(logging_context, webnn_operands.at(filter_tensor_id).as<bool>());
 +      if (bias_tensor_id >= 0) {
@@ -17159,6 +17169,133 @@ index 00000000000..b22d8f5caf4
 +    return kTfLiteOk;
 +  }
 +
++  static TfLiteStatus VisitSliceNode(
++      const emscripten::val& builder, TfLiteContext* logging_context,
++      int node_index, TfLiteNode* node, const TfLiteTensor* tensors,
++      std::unordered_map<int, emscripten::val>& webnn_operands,
++      const bool detect_supported_op) {
++    const int input_tensor_id = node->inputs->data[0];
++    const int begin_tensor_id = node->inputs->data[1];
++    const int size_tensor_id = node->inputs->data[2];
++    const int output_tensor_id = node->outputs->data[0];
++    const TfLiteTensor& input_tensor = tensors[input_tensor_id];
++    const TfLiteTensor& begin_tensor = tensors[begin_tensor_id];
++    const TfLiteTensor& size_tensor = tensors[size_tensor_id];
++    const TfLiteTensor& output_tensor = tensors[output_tensor_id];
++
++    TF_LITE_ENSURE_STATUS(CheckShapeTensorShape(logging_context, begin_tensor,
++                                                begin_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorStaticAllocation(
++        logging_context, begin_tensor, begin_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorInt32OrInt64Type(
++        logging_context, begin_tensor, begin_tensor_id, node_index));
++
++    TF_LITE_ENSURE_STATUS(CheckShapeTensorShape(logging_context, size_tensor,
++                                                size_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorStaticAllocation(
++        logging_context, size_tensor, size_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorInt32OrInt64Type(
++        logging_context, size_tensor, size_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorsDimensionMatch(
++        logging_context, begin_tensor, size_tensor, 0, node_index, "SLICE"));
++
++    const int num_dims = begin_tensor.dims->data[0];
++
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32Type(logging_context, input_tensor,
++                                                 input_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorShape(logging_context, input_tensor,
++                                           num_dims, input_tensor_id));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, input_tensor, input_tensor_id, node_index));
++
++    TF_LITE_ENSURE_STATUS(CheckTensorFloat32Type(logging_context, output_tensor,
++                                                 output_tensor_id, node_index));
++    TF_LITE_ENSURE_STATUS(CheckTensorShape(logging_context, output_tensor,
++                                           num_dims, output_tensor_id));
++    TF_LITE_ENSURE_STATUS(CheckTensorNonDynamicAllocation(
++        logging_context, output_tensor, output_tensor_id, node_index));
++
++    const auto input_shape = input_tensor.dims;
++    const auto output_shape = output_tensor.dims;
++    std::vector<int64_t> begin(num_dims);
++    std::vector<int64_t> size(num_dims);
++    CopyTensorDataInt32OrInt64(begin.data(), begin_tensor, num_dims);
++    CopyTensorDataInt32OrInt64(size.data(), size_tensor, num_dims);
++
++    for (size_t i = 0; i < num_dims; i++) {
++      if (begin[i] < 0) {
++        TF_LITE_MAYBE_KERNEL_LOG(logging_context,
++                                 "begin %" PRId64
++                                 " must be greater than 0 in SLICE node #%d",
++                                 begin[i], node_index);
++      }
++      if (begin[i] >= input_shape->data[i]) {
++        TF_LITE_MAYBE_KERNEL_LOG(
++            logging_context,
++            "begin %" PRId64
++            " must be less than input dimension %d in SLICE node #%d",
++            begin[i], input_shape->data[i], node_index);
++      }
++      if (size[i] <= 0) {
++        if (size[i] != -1) {
++          TF_LITE_MAYBE_KERNEL_LOG(logging_context,
++                                   "size %" PRId64
++                                   " must be positive or -1 in SLICE node #%d",
++                                   size[i], node_index);
++          return kTfLiteError;
++        }
++        size[i] = input_shape->data[i] - begin[i];
++      }
++      if (size[i] > input_shape->data[i]) {
++        TF_LITE_MAYBE_KERNEL_LOG(logging_context,
++                                 "size %" PRId64
++                                 " must be less than or equals to input "
++                                 "dimension %d in SLICE node #%d",
++                                 size[i], input_shape->data[i], node_index);
++        return kTfLiteError;
++      }
++      if (size[i] != output_shape->data[i]) {
++        TF_LITE_MAYBE_KERNEL_LOG(logging_context,
++                                 "size %" PRId64
++                                 " does not match output shape %d at "
++                                 "dimension %d in SLICE node #%d",
++                                 size[i], output_shape->data[i], i, node_index);
++        return kTfLiteError;
++      }
++      if (begin[i] + size[i] > input_shape->data[i]) {
++        TF_LITE_MAYBE_KERNEL_LOG(logging_context,
++                                 "begin + size (%" PRId64 " + %" PRId64
++                                 ") must not be greater than input "
++                                 "dimension %d in SLICE node #%d",
++                                 begin[i], size[i], input_shape->data[i],
++                                 node_index);
++        return kTfLiteError;
++      }
++    }
++
++    if (detect_supported_op) {
++      TF_LITE_ENSURE_STATUS(CheckWebNNOpSupport(builder, "slice"));
++    } else {
++      TF_LITE_ENSURE(logging_context,
++                     webnn_operands.at(input_tensor_id).as<bool>());
++      std::vector<int32_t> starts;
++      std::vector<int32_t> sizes;
++      std::transform(begin.cbegin(), begin.cend(), std::back_inserter(starts),
++                     [](int64_t i) { return static_cast<int32_t>(i); });
++      std::transform(size.cbegin(), size.cend(), std::back_inserter(sizes),
++                     [](int64_t i) { return static_cast<int32_t>(i); });
++      webnn_operands.insert(std::make_pair(
++          output_tensor_id, builder.call<emscripten::val>(
++                                "slice", webnn_operands.at(input_tensor_id),
++                                emscripten::val::array(starts),
++                                emscripten::val::array(sizes))));
++      TF_LITE_ENSURE(logging_context,
++                     webnn_operands.at(output_tensor_id).as<bool>());
++    }
++
++    return kTfLiteOk;
++  }
++
 +  static TfLiteStatus VisitSoftmaxNode(
 +      const emscripten::val& builder, TfLiteContext* logging_context,
 +      int node_index, TfLiteNode* node, const TfLiteTensor* tensors,
@@ -17321,6 +17458,7 @@ index 00000000000..b22d8f5caf4
 +  static TfLiteStatus VisitUnaryNode(
 +      const emscripten::val& builder, TfLiteContext* logging_context,
 +      int node_index, TfLiteNode* node, const TfLiteTensor* tensors,
++      const TfLiteStridedSliceParams* params,
 +      std::unordered_map<int, emscripten::val>& webnn_operands,
 +      const bool detect_supported_op, const std::string unary_node_name) {
 +    TF_LITE_ENSURE_STATUS(
