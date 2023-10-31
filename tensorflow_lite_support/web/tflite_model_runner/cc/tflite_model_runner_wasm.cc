@@ -97,7 +97,9 @@ EMSCRIPTEN_BINDINGS(tf_lite_web_model_runner_structs) {
       .field("enableWebNNDelegate",
              &tfweb::generic::TFLiteWebModelRunnerOptions::enable_webnn_delegate)
       .field("webNNDevicePreference",
-             &tfweb::generic::TFLiteWebModelRunnerOptions::webnn_device_preference);
+             &tfweb::generic::TFLiteWebModelRunnerOptions::webnn_device_preference)
+      .field("webNNNumThreads",
+             &tfweb::generic::TFLiteWebModelRunnerOptions::webnn_num_threads);
   class_<tfweb::generic::TFLiteWebModelRunnerTensorInfo>(
       "TFLiteWebModelRunnerTensorInfo")
       .function("data", &GetRawBufferFromTFLiteWebModelRunnerTensorInfo)

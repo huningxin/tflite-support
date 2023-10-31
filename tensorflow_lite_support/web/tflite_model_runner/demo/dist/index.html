@@ -63,8 +63,9 @@
     Use WebNN delegate: <input type="checkbox" id="webnnDelegate" />
     Device preference:
     <select id="webnnDevice">
+      <option value="0">cpu</option>
       <option value="1">gpu</option>
-      <option value="2">cpu</option>
+      <option value="2">npu</option>
     </select>
   </div>
   <div>
@@ -75,7 +76,7 @@
     <img src="wine.jpeg" alt="wine" />
     <div class="result"></div>
   </div>
-  <script src="./tflite_model_runner_cc_simd.js"></script>
+  <!-- <script src="./tflite_model_runner_cc_simd.js"></script> -->
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs/dist/tf.min.js"></script>
   <script src="./script.js"></script>
 </body>

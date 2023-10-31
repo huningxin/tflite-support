@@ -1,7 +1,7 @@
 'use strict';
 
 // tfjs-tflite + webnn external delegate
-importScripts('https://cdn.jsdelivr.net/npm/@webmachinelearning/webnn-polyfill/dist/webnn-polyfill.js');
+// importScripts('https://cdn.jsdelivr.net/npm/@webmachinelearning/webnn-polyfill/dist/webnn-polyfill.js');
 importScripts("https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core");
 importScripts("https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-cpu");
 importScripts('./tfjs-tflite/tf-tflite.js');
@@ -25,7 +25,7 @@ onmessage = async (message) => {
         const webNNDevicePreference = parseInt(message.data.webNNDevicePreference);
 
         if (enableWebNNDelegate) {
-          options.delegatePath = './webnn_external_delegate_wasm.wasm';
+          options.delegatePath = '../webnn_external_delegate_wasm.wasm';
         }
 
         tflite.setWasmPath('./tfjs-tflite/');
