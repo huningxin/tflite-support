@@ -37,8 +37,10 @@ struct TFLiteWebModelRunnerOptions {
 
   bool enable_webnn_delegate = false;
 
-  // 0 - default, 1 - gpu, 2 - cpu
+  // 0 - cpu, 1 - gpu, 2 - npu
   int webnn_device_preference = 0;
+
+  int webnn_num_threads = 0;
 
   // TODO(jingjin): Add more as needed.
 };
