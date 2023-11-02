@@ -14420,10 +14420,10 @@ index 00000000000..ef2dd7c66c3
 \ No newline at end of file
 diff --git a/tensorflow/lite/delegates/webnn/webnn_delegate.cc b/tensorflow/lite/delegates/webnn/webnn_delegate.cc
 new file mode 100644
-index 00000000000..06f1aacf06c
+index 00000000000..e34bb8a8add
 --- /dev/null
 +++ b/tensorflow/lite/delegates/webnn/webnn_delegate.cc
-@@ -0,0 +1,3974 @@
+@@ -0,0 +1,3975 @@
 +/* Copyright 2021 The TensorFlow Authors. All Rights Reserved.
 +
 +Licensed under the Apache License, Version 2.0 (the "License");
@@ -14687,6 +14687,7 @@ index 00000000000..06f1aacf06c
 +      if (inputs.count(t) != 0 || quasi_static_tensors.count(t) != 0) {
 +        emscripten::val desc = emscripten::val::object();
 +        desc.set("type", emscripten::val(datatype));
++        desc.set("dataType", emscripten::val(datatype));
 +        // Workaround for single-value operand as which is not supported in Chromium yet
 +        // TODO: remove this workaround once it is supported
 +        if (dims.size() == 0) {
